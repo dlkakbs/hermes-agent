@@ -1086,7 +1086,8 @@ class AIAgent:
             else:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (auto-compression disabled)")
 
-        from hermes_cli.plugins import invoke_hook
+        from hermes_cli.plugins import discover_plugins, invoke_hook
+        discover_plugins()
         invoke_hook("on_session_start", session_id=self.session_id, platform=self.platform or "cli")
 
     def reset_session_state(self):
