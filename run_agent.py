@@ -1086,6 +1086,9 @@ class AIAgent:
             else:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (auto-compression disabled)")
 
+        from hermes_cli.plugins import invoke_hook
+        invoke_hook("on_session_start", session_id=self.session_id, platform=self.platform or "cli")
+
     def reset_session_state(self):
         """Reset all session-scoped token counters to 0 for a fresh session.
         
@@ -3460,6 +3463,8 @@ class AIAgent:
                 if request_client is not None:
                     self._close_request_openai_client(request_client, reason="request_complete")
 
+        from hermes_cli.plugins import invoke_hook
+        invoke_hook("pre_llm_call", messages=api_kwargs.get("messages", []), model=api_kwargs.get("model", ""))
         t = threading.Thread(target=_call, daemon=True)
         t.start()
         while t.is_alive():
@@ -3486,6 +3491,7 @@ class AIAgent:
                 raise InterruptedError("Agent interrupted during API call")
         if result["error"] is not None:
             raise result["error"]
+        invoke_hook("post_llm_call", messages=api_kwargs.get("messages", []), response=result["response"], model=api_kwargs.get("model", ""))
         return result["response"]
 
     # ── Unified streaming API call ─────────────────────────────────────────
@@ -3764,6 +3770,8 @@ class AIAgent:
                 if request_client is not None:
                     self._close_request_openai_client(request_client, reason="stream_request_complete")
 
+        from hermes_cli.plugins import invoke_hook
+        invoke_hook("pre_llm_call", messages=api_kwargs.get("messages", []), model=api_kwargs.get("model", ""))
         t = threading.Thread(target=_call, daemon=True)
         t.start()
         while t.is_alive():
@@ -3787,6 +3795,7 @@ class AIAgent:
                 raise InterruptedError("Agent interrupted during streaming API call")
         if result["error"] is not None:
             raise result["error"]
+        invoke_hook("post_llm_call", messages=api_kwargs.get("messages", []), response=result["response"], model=api_kwargs.get("model", ""))
         return result["response"]
 
     # ── Provider fallback ──────────────────────────────────────────────────
@@ -7094,6 +7103,9 @@ class AIAgent:
 
         # Persist session to both JSON log and SQLite
         self._persist_session(messages, conversation_history)
+
+        from hermes_cli.plugins import invoke_hook
+        invoke_hook("on_session_end", session_id=self.session_id, platform=self.platform or "cli")
 
         # Sync conversation to Honcho for user modeling
         if final_response and not interrupted and sync_honcho:
