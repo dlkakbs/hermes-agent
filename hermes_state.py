@@ -15,13 +15,17 @@ Key design decisions:
 """
 
 import json
+import logging
 import os
+import random
 import re
 import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
@@ -219,6 +223,18 @@ class SessionDB:
     # Session lifecycle
     # =========================================================================
 
+    def _with_retry(self, fn, *, retries: int = 3, base_delay: float = 0.1):
+        """Execute fn(), retrying on 'database is locked' up to `retries` times."""
+        for attempt in range(retries + 1):
+            try:
+                return fn()
+            except sqlite3.OperationalError as e:
+                if "database is locked" not in str(e) or attempt == retries:
+                    raise
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 0.05)
+                logger.warning("SQLite DB locked (attempt %d/%d), retrying in %.2fs", attempt + 1, retries, delay)
+                time.sleep(delay)
+
     def create_session(
         self,
         session_id: str,
@@ -230,23 +246,25 @@ class SessionDB:
         parent_session_id: str = None,
     ) -> str:
         """Create a new session record. Returns the session_id."""
-        with self._lock:
-            self._conn.execute(
-                """INSERT INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    source,
-                    user_id,
-                    model,
-                    json.dumps(model_config) if model_config else None,
-                    system_prompt,
-                    parent_session_id,
-                    time.time(),
-                ),
-            )
-            self._conn.commit()
+        def _do():
+            with self._lock:
+                self._conn.execute(
+                    """INSERT INTO sessions (id, source, user_id, model, model_config,
+                       system_prompt, parent_session_id, started_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        session_id,
+                        source,
+                        user_id,
+                        model,
+                        json.dumps(model_config) if model_config else None,
+                        system_prompt,
+                        parent_session_id,
+                        time.time(),
+                    ),
+                )
+                self._conn.commit()
+        self._with_retry(_do)
         return session_id
 
     def end_session(self, session_id: str, end_reason: str) -> None:
@@ -594,45 +612,50 @@ class SessionDB:
         Also increments the session's message_count (and tool_call_count
         if role is 'tool' or tool_calls is present).
         """
-        with self._lock:
-            cursor = self._conn.execute(
-                """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, timestamp, token_count, finish_reason)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    session_id,
-                    role,
-                    content,
-                    tool_call_id,
-                    json.dumps(tool_calls) if tool_calls else None,
-                    tool_name,
-                    time.time(),
-                    token_count,
-                    finish_reason,
-                ),
-            )
-            msg_id = cursor.lastrowid
+        result = {}
 
-            # Update counters
-            # Count actual tool calls from the tool_calls list (not from tool responses).
-            # A single assistant message can contain multiple parallel tool calls.
-            num_tool_calls = 0
-            if tool_calls is not None:
-                num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
-            if num_tool_calls > 0:
-                self._conn.execute(
-                    """UPDATE sessions SET message_count = message_count + 1,
-                       tool_call_count = tool_call_count + ? WHERE id = ?""",
-                    (num_tool_calls, session_id),
+        def _do():
+            with self._lock:
+                cursor = self._conn.execute(
+                    """INSERT INTO messages (session_id, role, content, tool_call_id,
+                       tool_calls, tool_name, timestamp, token_count, finish_reason)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        session_id,
+                        role,
+                        content,
+                        tool_call_id,
+                        json.dumps(tool_calls) if tool_calls else None,
+                        tool_name,
+                        time.time(),
+                        token_count,
+                        finish_reason,
+                    ),
                 )
-            else:
-                self._conn.execute(
-                    "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
-                    (session_id,),
-                )
+                result["msg_id"] = cursor.lastrowid
 
-            self._conn.commit()
-        return msg_id
+                # Update counters
+                # Count actual tool calls from the tool_calls list (not from tool responses).
+                # A single assistant message can contain multiple parallel tool calls.
+                num_tool_calls = 0
+                if tool_calls is not None:
+                    num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
+                if num_tool_calls > 0:
+                    self._conn.execute(
+                        """UPDATE sessions SET message_count = message_count + 1,
+                           tool_call_count = tool_call_count + ? WHERE id = ?""",
+                        (num_tool_calls, session_id),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
+                        (session_id,),
+                    )
+
+                self._conn.commit()
+
+        self._with_retry(_do)
+        return result["msg_id"]
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by timestamp."""

@@ -1,8 +1,10 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
+import sqlite3
 import time
 import pytest
 from pathlib import Path
+from unittest.mock import patch
 
 from hermes_state import SessionDB
 
@@ -1031,3 +1033,47 @@ class TestResolveSessionByNameOrId:
         db.set_session_title("s1", "my project")
         result = db.resolve_session_by_title("my project")
         assert result == "s1"
+
+
+# =========================================================================
+# DB lock retry
+# =========================================================================
+
+class TestWithRetry:
+    def test_retries_on_db_locked(self, db):
+        """_with_retry should retry on 'database is locked' and succeed on second attempt."""
+        calls = {"count": 0}
+
+        def flaky():
+            calls["count"] += 1
+            if calls["count"] < 2:
+                raise sqlite3.OperationalError("database is locked")
+            return "ok"
+
+        with patch("time.sleep"):
+            result = db._with_retry(flaky)
+
+        assert result == "ok"
+        assert calls["count"] == 2
+
+    def test_raises_after_max_retries(self, db):
+        """_with_retry should re-raise after exhausting all retries."""
+        def always_locked():
+            raise sqlite3.OperationalError("database is locked")
+
+        with patch("time.sleep"):
+            with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+                db._with_retry(always_locked, retries=3)
+
+    def test_does_not_retry_other_errors(self, db):
+        """_with_retry should not retry on unrelated OperationalError."""
+        calls = {"count": 0}
+
+        def other_error():
+            calls["count"] += 1
+            raise sqlite3.OperationalError("no such table: foo")
+
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            db._with_retry(other_error)
+
+        assert calls["count"] == 1

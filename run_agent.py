@@ -891,7 +891,7 @@ class AIAgent:
                     user_id=None,
                 )
             except Exception as e:
-                logger.debug("Session DB create_session failed: %s", e)
+                logger.warning("Session DB create_session failed, session will not be indexed: %s", e)
         
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
@@ -1545,7 +1545,7 @@ class AIAgent:
                 )
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
-            logger.debug("Session DB append_message failed: %s", e)
+            logger.warning("Session DB append_message failed: %s", e)
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
