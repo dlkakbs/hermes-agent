@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 MODEL_MAP = {
-    "kling":   "fal-ai/kling-video/v1.5/pro",
+    "kling":   "fal-ai/kling-video/v1/standard/text-to-video",
     "luma":    "fal-ai/luma-dream-machine",
     "minimax": "fal-ai/minimax/video-01-live",
     "hunyuan": "fal-ai/hunyuan-video",
@@ -111,6 +111,7 @@ def _build_arguments(model_key: str, prompt: str, duration: int, aspect_ratio: s
     elif model_key == "luma":
         args["aspect_ratio"] = _ASPECT_MAP[aspect_ratio]
         args["loop"] = False
+        # Luma Dream Machine root endpoint does not accept a duration parameter
         if image_url:
             args["image_url"] = image_url
 
@@ -124,7 +125,8 @@ def _build_arguments(model_key: str, prompt: str, duration: int, aspect_ratio: s
 
     elif model_key == "veo2":
         args["aspect_ratio"] = _ASPECT_MAP[aspect_ratio]
-        args["duration"] = str(duration)
+        veo2_dur = min(duration, 8)                # veo2 max is 8s, valid: "5s"–"8s"
+        args["duration"] = f"{veo2_dur}s"
         # veo2 is text-to-video only
 
     elif model_key == "ltx":
@@ -173,8 +175,15 @@ def _download_video(url: str) -> str:
 
     logger.info("Downloading video from FAL.ai CDN → %s", tmp_path)
     urllib.request.urlretrieve(url, tmp_path)
-    size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
-    logger.info("Downloaded %.1f MB", size_mb)
+    size_bytes = os.path.getsize(tmp_path)
+    size_mb = size_bytes / (1024 * 1024)
+    logger.info("Downloaded %.1f MB (%d bytes)", size_mb, size_bytes)
+    if size_bytes < 10_000:  # < 10 KB is clearly not a real video
+        os.unlink(tmp_path)
+        raise ValueError(
+            f"Downloaded file is too small ({size_bytes} bytes) — "
+            "CDN placeholder or generation failed. URL: " + url
+        )
     return tmp_path
 
 
