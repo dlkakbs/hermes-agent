@@ -262,6 +262,7 @@ def video_generate_tool(
             "video_url": video_url,
             "model": model_key,
             "duration_seconds": duration,
+            "media_tag": f"MEDIA:{video_path}",
         }, indent=2)
 
     except Exception as exc:
@@ -293,8 +294,9 @@ VIDEO_GENERATE_SCHEMA = {
     "name": "video_generate",
     "description": (
         "Generate a short MP4 video from a text prompt using FAL.ai AI video models. "
-        "Returns a local file path — pass it to send_message to deliver the video. "
-        "Generation takes 30–120 seconds. "
+        "Returns a media_tag (MEDIA:<path>) — include it in your response to deliver the video "
+        "as a native video message (Telegram inline playback, Discord/Slack attachment). "
+        "Generation takes 30–120 seconds — warn the user before starting. "
         "Models: 'kling' (default, best quality, supports 10s), 'luma' (cinematic), 'minimax' (fast)."
     ),
     "parameters": {

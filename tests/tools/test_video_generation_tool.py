@@ -229,6 +229,12 @@ class TestVideoGenerateToolSuccess:
         result, _ = self._run()
         assert result["video_url"] == self.VIDEO_URL
 
+    def test_returns_media_tag(self):
+        result, _ = self._run()
+        assert "media_tag" in result
+        assert result["media_tag"].startswith("MEDIA:")
+        assert result["video_path"] in result["media_tag"]
+
     def test_returns_model_name(self):
         result, _ = self._run(model="luma")
         assert result["model"] == "luma"
