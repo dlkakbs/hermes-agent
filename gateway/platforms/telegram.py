@@ -1811,6 +1811,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     if not chat_topic:
                         chat_topic = created_name
 
+            # If no DM topic was resolved, Telegram may have set message_thread_id
+            # to indicate a reply chain (not a real forum topic). Drop it so downstream
+            # send calls don't fail with "Message thread not found".
+            if not chat_topic:
+                thread_id_str = None
+
         # Build source
         source = self.build_source(
             chat_id=str(chat.id),
