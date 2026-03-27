@@ -2,7 +2,7 @@
 OpenAI-compatible API server platform adapter.
 
 Exposes an HTTP server with endpoints:
-- POST /v1/chat/completions        — OpenAI Chat Completions format (stateless)
+- POST /v1/chat/completions        — OpenAI Chat Completions format (persistent when X-Chat-ID header is supplied)
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
@@ -283,6 +283,12 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        self._session_db = None
+        try:
+            from hermes_state import SessionDB
+            self._session_db = SessionDB()
+        except Exception as e:
+            logger.debug("SQLite session store not available: %s", e)
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -361,6 +367,8 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        platform: str = "api_server",
+        session_db=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -384,7 +392,8 @@ class APIServerAdapter(BasePlatformAdapter):
             verbose_logging=False,
             ephemeral_system_prompt=ephemeral_system_prompt or None,
             session_id=session_id,
-            platform="api_server",
+            platform=platform,
+            session_db=session_db,
             stream_delta_callback=stream_delta_callback,
         )
         return agent
@@ -468,7 +477,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        session_id = str(uuid.uuid4())
+        # Use X-Chat-ID header as a stable session key so Open WebUI chats
+        # accumulate in the session store under a single session rather than
+        # creating a new UUID-keyed session on every request.  When no header
+        # is present we fall back to a fresh UUID (stateless, same as before).
+        chat_id = request.headers.get("X-Chat-ID", "").strip()
+        if chat_id:
+            session_id = chat_id
+            session_platform = "webui"
+            session_db = self._session_db
+        else:
+            session_id = str(uuid.uuid4())
+            session_platform = "api_server"
+            session_db = None  # stateless — don't persist
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", "hermes-agent")
         created = int(time.time())
@@ -487,6 +509,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                platform=session_platform,
+                session_db=session_db,
             ))
 
             return await self._write_sse_chat_completion(
@@ -500,6 +524,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                platform=session_platform,
+                session_db=session_db,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1129,6 +1155,8 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        platform: str = "api_server",
+        session_db=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -1143,6 +1171,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
+                platform=platform,
+                session_db=session_db,
             )
             result = agent.run_conversation(
                 user_message=user_message,
