@@ -513,6 +513,10 @@ def cmd_chat(args):
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
 
+    # --source: tag session source for filtering (e.g. 'tool' for third-party integrations)
+    if getattr(args, "source", None):
+        os.environ["HERMES_SESSION_SOURCE"] = args.source
+
     # Import and run the CLI
     from cli import main as cli_main
     
@@ -791,6 +795,7 @@ def cmd_model(args):
         "ai-gateway": "AI Gateway",
         "kilocode": "Kilo Code",
         "alibaba": "Alibaba Cloud (DashScope)",
+        "huggingface": "Hugging Face",
         "custom": "Custom endpoint",
     }
     active_label = provider_labels.get(active, active)
@@ -817,6 +822,7 @@ def cmd_model(args):
         ("opencode-go", "OpenCode Go (open models, $10/month subscription)"),
         ("ai-gateway", "AI Gateway (Vercel — 200+ models, pay-per-use)"),
         ("alibaba", "Alibaba Cloud / DashScope (Qwen models, Anthropic-compatible)"),
+        ("huggingface", "Hugging Face Inference Providers (20+ open models)"),
     ]
 
     # Add user-defined custom providers from config.yaml
@@ -889,7 +895,7 @@ def cmd_model(args):
         _model_flow_anthropic(config, current_model)
     elif selected_provider == "kimi-coding":
         _model_flow_kimi(config, current_model)
-    elif selected_provider in ("zai", "minimax", "minimax-cn", "kilocode", "opencode-zen", "opencode-go", "ai-gateway", "alibaba"):
+    elif selected_provider in ("zai", "minimax", "minimax-cn", "kilocode", "opencode-zen", "opencode-go", "ai-gateway", "alibaba", "huggingface"):
         _model_flow_api_key_provider(config, selected_provider, current_model)
 
 
@@ -1497,6 +1503,27 @@ _PROVIDER_MODELS = {
         "openai/gpt-5.4",
         "google/gemini-3-pro-preview",
         "google/gemini-3-flash-preview",
+    ],
+    # Curated model list sourced from https://models.dev (huggingface provider)
+    "huggingface": [
+        "Qwen/Qwen3.5-397B-A17B",
+        "Qwen/Qwen3-235B-A22B-Thinking-2507",
+        "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+        "Qwen/Qwen3-Coder-Next",
+        "Qwen/Qwen3-Next-80B-A3B-Instruct",
+        "Qwen/Qwen3-Next-80B-A3B-Thinking",
+        "deepseek-ai/DeepSeek-R1-0528",
+        "deepseek-ai/DeepSeek-V3.2",
+        "moonshotai/Kimi-K2-Instruct",
+        "moonshotai/Kimi-K2-Instruct-0905",
+        "moonshotai/Kimi-K2.5",
+        "moonshotai/Kimi-K2-Thinking",
+        "MiniMaxAI/MiniMax-M2.5",
+        "MiniMaxAI/MiniMax-M2.1",
+        "XiaomiMiMo/MiMo-V2-Flash",
+        "zai-org/GLM-5",
+        "zai-org/GLM-4.7",
+        "zai-org/GLM-4.7-Flash",
     ],
 }
 
@@ -3118,7 +3145,7 @@ For more help on a command:
     )
     chat_parser.add_argument(
         "--provider",
-        choices=["auto", "openrouter", "nous", "openai-codex", "copilot-acp", "copilot", "anthropic", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode"],
+        choices=["auto", "openrouter", "nous", "openai-codex", "copilot-acp", "copilot", "anthropic", "huggingface", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode"],
         default=None,
         help="Inference provider (default: auto)"
     )
@@ -3169,6 +3196,11 @@ For more help on a command:
         action="store_true",
         default=False,
         help="Include the session ID in the agent's system prompt"
+    )
+    chat_parser.add_argument(
+        "--source",
+        default=None,
+        help="Session source tag for filtering (default: cli). Use 'tool' for third-party integrations that should not appear in user session lists."
     )
     chat_parser.set_defaults(func=cmd_chat)
 
@@ -3868,8 +3900,12 @@ For more help on a command:
 
         action = args.sessions_action
 
+        # Hide third-party tool sessions by default, but honour explicit --source
+        _source = getattr(args, "source", None)
+        _exclude = None if _source else ["tool"]
+
         if action == "list":
-            sessions = db.list_sessions_rich(source=args.source, limit=args.limit)
+            sessions = db.list_sessions_rich(source=args.source, exclude_sources=_exclude, limit=args.limit)
             if not sessions:
                 print("No sessions found.")
                 return
@@ -3952,7 +3988,8 @@ For more help on a command:
         elif action == "browse":
             limit = getattr(args, "limit", 50) or 50
             source = getattr(args, "source", None)
-            sessions = db.list_sessions_rich(source=source, limit=limit)
+            _browse_exclude = None if source else ["tool"]
+            sessions = db.list_sessions_rich(source=source, exclude_sources=_browse_exclude, limit=limit)
             db.close()
             if not sessions:
                 print("No sessions found.")

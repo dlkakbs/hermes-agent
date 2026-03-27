@@ -264,11 +264,13 @@ DEFAULT_CONFIG = {
         "compact": False,
         "personality": "kawaii",
         "resume_display": "full",
+        "busy_input_mode": "interrupt",
         "bell_on_complete": False,
         "show_reasoning": False,
         "streaming": False,
         "show_cost": False,       # Show $ cost in the status bar (off by default)
         "skin": "default",
+        "tool_progress_command": False,  # Enable /verbose command in messaging gateway
     },
 
     # Privacy settings
@@ -586,6 +588,21 @@ OPTIONAL_ENV_VARS = {
     "OPENCODE_GO_BASE_URL": {
         "description": "OpenCode Go base URL override",
         "prompt": "OpenCode Go base URL (leave empty for default)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "HF_TOKEN": {
+        "description": "Hugging Face token for Inference Providers (20+ open models via router.huggingface.co)",
+        "prompt": "Hugging Face Token",
+        "url": "https://huggingface.co/settings/tokens",
+        "password": True,
+        "category": "provider",
+    },
+    "HF_BASE_URL": {
+        "description": "Hugging Face Inference Providers base URL override",
+        "prompt": "HF base URL (leave empty for default)",
         "url": None,
         "password": False,
         "category": "provider",

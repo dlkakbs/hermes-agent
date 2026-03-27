@@ -62,7 +62,12 @@ else:
 
 
 # Import our tool system
-from model_tools import get_tool_definitions, handle_function_call, check_toolset_requirements
+from model_tools import (
+    get_tool_definitions,
+    get_toolset_for_tool,
+    handle_function_call,
+    check_toolset_requirements,
+)
 from tools.terminal_tool import cleanup_vm
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
@@ -486,6 +491,7 @@ class AIAgent:
         # instead of going directly to stdout where patch_stdout's StdoutProxy
         # would mangle the escape sequences.  None = use builtins.print.
         self._print_fn = None
+        self.background_review_callback = None  # Optional sync callback for gateway delivery
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
         self.log_prefix_chars = log_prefix_chars
@@ -533,6 +539,7 @@ class AIAgent:
         self.tool_progress_callback = tool_progress_callback
         self.thinking_callback = thinking_callback
         self.reasoning_callback = reasoning_callback
+        self._reasoning_deltas_fired = False  # Set by _fire_reasoning_delta, reset per API call
         self.clarify_callback = clarify_callback
         self.step_callback = step_callback
         self.stream_delta_callback = stream_delta_callback
@@ -883,7 +890,7 @@ class AIAgent:
             try:
                 self._session_db.create_session(
                     session_id=self.session_id,
-                    source=self.platform or "cli",
+                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
                     model_config={
                         "max_iterations": self.max_iterations,
@@ -1525,6 +1532,12 @@ class AIAgent:
                 if actions:
                     summary = " · ".join(dict.fromkeys(actions))
                     self._safe_print(f"  💾 {summary}")
+                    _bg_cb = self.background_review_callback
+                    if _bg_cb:
+                        try:
+                            _bg_cb(f"💾 {summary}")
+                        except Exception:
+                            pass
 
             except Exception as e:
                 logger.debug("Background memory/skill review failed: %s", e)
@@ -2048,6 +2061,23 @@ class AIAgent:
                     msg["content"] = self._clean_session_content(msg["content"])
                 cleaned.append(msg)
 
+            # Guard: never overwrite a larger session log with fewer messages.
+            # This protects against data loss when --resume loads a session whose
+            # messages weren't fully written to SQLite — the resumed agent starts
+            # with partial history and would otherwise clobber the full JSON log.
+            if self.session_log_file.exists():
+                try:
+                    existing = json.loads(self.session_log_file.read_text(encoding="utf-8"))
+                    existing_count = existing.get("message_count", len(existing.get("messages", [])))
+                    if existing_count > len(cleaned):
+                        logging.debug(
+                            "Skipping session log overwrite: existing has %d messages, current has %d",
+                            existing_count, len(cleaned),
+                        )
+                        return
+                except Exception:
+                    pass  # corrupted existing file — allow the overwrite
+
             entry = {
                 "session_id": self.session_id,
                 "model": self.model,
@@ -2274,7 +2304,7 @@ class AIAgent:
                 return
             try:
                 manager.flush_all()
-            except Exception as exc:
+            except (Exception, KeyboardInterrupt) as exc:
                 logger.debug("Honcho flush on exit failed (non-fatal): %s", exc)
 
         atexit.register(_flush_honcho_on_exit)
@@ -2496,7 +2526,13 @@ class AIAgent:
 
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
         if has_skills_tools:
-            avail_toolsets = {ts for ts, avail in check_toolset_requirements().items() if avail}
+            avail_toolsets = {
+                toolset
+                for toolset in (
+                    get_toolset_for_tool(tool_name) for tool_name in self.valid_tool_names
+                )
+                if toolset
+            }
             skills_prompt = build_skills_system_prompt(
                 available_tools=self.valid_tool_names,
                 available_toolsets=avail_toolsets,
@@ -3380,6 +3416,7 @@ class AIAgent:
         max_stream_retries = 1
         has_tool_calls = False
         first_delta_fired = False
+        self._reasoning_deltas_fired = False
         for attempt in range(max_stream_retries + 1):
             try:
                 with active_client.responses.stream(**api_kwargs) as stream:
@@ -3656,6 +3693,7 @@ class AIAgent:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
+        self._reasoning_deltas_fired = True
         cb = self.reasoning_callback
         if cb is not None:
             try:
@@ -3734,7 +3772,7 @@ class AIAgent:
         def _call_chat_completions():
             """Stream a chat completions response."""
             import httpx as _httpx
-            _base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 900.0))
+            _base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
             _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 60.0))
             stream_kwargs = {
                 **api_kwargs,
@@ -3750,6 +3788,9 @@ class AIAgent:
             request_client_holder["client"] = self._create_request_openai_client(
                 reason="chat_completion_stream_request"
             )
+            # Reset stale-stream timer so the detector measures from this
+            # attempt's start, not a previous attempt's last chunk.
+            last_chunk_time["t"] = time.time()
             stream = request_client_holder["client"].chat.completions.create(**stream_kwargs)
 
             content_parts: list = []
@@ -3760,6 +3801,9 @@ class AIAgent:
             role = "assistant"
             reasoning_parts: list = []
             usage_obj = None
+            # Reset per-call reasoning tracking so _build_assistant_message
+            # knows whether reasoning was already displayed during streaming.
+            self._reasoning_deltas_fired = False
 
             for chunk in stream:
                 last_chunk_time["t"] = time.time()
@@ -3879,7 +3923,10 @@ class AIAgent:
             works unchanged.
             """
             has_tool_use = False
+            self._reasoning_deltas_fired = False
 
+            # Reset stale-stream timer for this attempt
+            last_chunk_time["t"] = time.time()
             # Use the Anthropic SDK's streaming context manager
             with self._anthropic_client.messages.stream(**api_kwargs) as stream:
                 for event in stream:
@@ -3992,6 +4039,10 @@ class AIAgent:
                             )
 
                         try:
+                            # Reset stale timer — the non-streaming fallback
+                            # uses its own client; prevent the stale detector
+                            # from firing on stale timestamps from failed streams.
+                            last_chunk_time["t"] = time.time()
                             result["response"] = self._interruptible_api_call(api_kwargs)
                         except Exception as fallback_err:
                             result["error"] = fallback_err
@@ -4001,7 +4052,19 @@ class AIAgent:
                 if request_client is not None:
                     self._close_request_openai_client(request_client, reason="stream_request_complete")
 
-        _stream_stale_timeout = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 90.0))
+        _stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
+        # Scale the stale timeout for large contexts: slow models (like Opus)
+        # can legitimately think for minutes before producing the first token
+        # when the context is large.  Without this, the stale detector kills
+        # healthy connections during the model's thinking phase, producing
+        # spurious RemoteProtocolError ("peer closed connection").
+        _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+        if _est_tokens > 100_000:
+            _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
+        elif _est_tokens > 50_000:
+            _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
+        else:
+            _stream_stale_timeout = _stream_stale_timeout_base
 
         t = threading.Thread(target=_call, daemon=True)
         t.start()
@@ -4126,6 +4189,25 @@ class AIAgent:
                 ("openrouter" in fb_base_url.lower() and "claude" in fb_model.lower())
                 or is_native_anthropic
             )
+
+            # Update context compressor limits for the fallback model.
+            # Without this, compression decisions use the primary model's
+            # context window (e.g. 200K) instead of the fallback's (e.g. 32K),
+            # causing oversized sessions to overflow the fallback.
+            if hasattr(self, 'context_compressor') and self.context_compressor:
+                from agent.model_metadata import get_model_context_length
+                fb_context_length = get_model_context_length(
+                    self.model, base_url=self.base_url,
+                    api_key=self.api_key, provider=self.provider,
+                )
+                self.context_compressor.model = self.model
+                self.context_compressor.base_url = self.base_url
+                self.context_compressor.api_key = self.api_key
+                self.context_compressor.provider = self.provider
+                self.context_compressor.context_length = fb_context_length
+                self.context_compressor.threshold_tokens = int(
+                    fb_context_length * self.context_compressor.threshold_percent
+                )
 
             self._emit_status(
                 f"🔄 Primary model failed — switching to fallback: "
@@ -4296,6 +4378,10 @@ class AIAgent:
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_kwargs
             anthropic_messages = self._prepare_anthropic_messages_for_api(api_messages)
+            # Pass context_length so the adapter can clamp max_tokens if the
+            # user configured a smaller context window than the model's output limit.
+            ctx_len = getattr(self, "context_compressor", None)
+            ctx_len = ctx_len.context_length if ctx_len else None
             return build_anthropic_kwargs(
                 model=self.model,
                 messages=anthropic_messages,
@@ -4304,6 +4390,7 @@ class AIAgent:
                 reasoning_config=self.reasoning_config,
                 is_oauth=self._is_anthropic_oauth,
                 preserve_dots=self._anthropic_preserve_dots(),
+                context_length=ctx_len,
             )
 
         if self.api_mode == "codex_responses":
@@ -4415,7 +4502,7 @@ class AIAgent:
             "model": self.model,
             "messages": sanitized_messages,
             "tools": self.tools if self.tools else None,
-            "timeout": float(os.getenv("HERMES_API_TIMEOUT", 900.0)),
+            "timeout": float(os.getenv("HERMES_API_TIMEOUT", 1800.0)),
         }
 
         if self.max_tokens is not None:
@@ -4555,11 +4642,15 @@ class AIAgent:
             logging.debug(f"Captured reasoning ({len(reasoning_text)} chars): {reasoning_text}")
 
         if reasoning_text and self.reasoning_callback:
-            # Skip callback for <think>-extracted reasoning when streaming is active.
-            # _stream_delta() already displayed <think> blocks during streaming;
-            # firing the callback again would cause duplicate display.
-            # Structured reasoning (from reasoning_content field) always fires.
-            if _from_structured or not self.stream_delta_callback:
+            # Skip callback when streaming is active — reasoning was already
+            # displayed during the stream via one of two paths:
+            #   (a) _fire_reasoning_delta (structured reasoning_content deltas)
+            #   (b) _stream_delta tag extraction (<think>/<REASONING_SCRATCHPAD>)
+            # When streaming is NOT active, always fire so non-streaming modes
+            # (gateway, batch, quiet) still get reasoning.
+            # Any reasoning that wasn't shown during streaming is caught by the
+            # CLI post-response display fallback (cli.py _reasoning_shown_this_turn).
+            if not self.stream_delta_callback:
                 try:
                     self.reasoning_callback(reasoning_text)
                 except Exception:
@@ -4859,7 +4950,7 @@ class AIAgent:
                 self.session_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
                 self._session_db.create_session(
                     session_id=self.session_id,
-                    source=self.platform or "cli",
+                    source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
                     parent_session_id=old_session_id,
                 )
@@ -5080,7 +5171,7 @@ class AIAgent:
         spinner = None
         if self.quiet_mode and not self.tool_progress_callback:
             face = random.choice(KawaiiSpinner.KAWAII_WAITING)
-            spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots')
+            spinner = KawaiiSpinner(f"{face} ⚡ running {num_tools} tools concurrently", spinner_type='dots', print_fn=self._print_fn)
             spinner.start()
 
         try:
@@ -5121,7 +5212,7 @@ class AIAgent:
             # Print cute message per tool
             if self.quiet_mode:
                 cute_msg = _get_cute_tool_message_impl(name, args, tool_duration, result=function_result)
-                print(f"  {cute_msg}")
+                self._safe_print(f"  {cute_msg}")
             elif not self.quiet_mode:
                 if self.verbose_logging:
                     print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s")
@@ -5306,7 +5397,7 @@ class AIAgent:
                 spinner = None
                 if self.quiet_mode and not self.tool_progress_callback:
                     face = random.choice(KawaiiSpinner.KAWAII_WAITING)
-                    spinner = KawaiiSpinner(f"{face} {spinner_label}", spinner_type='dots')
+                    spinner = KawaiiSpinner(f"{face} {spinner_label}", spinner_type='dots', print_fn=self._print_fn)
                     spinner.start()
                 self._delegate_spinner = spinner
                 _delegate_result = None
@@ -5336,7 +5427,7 @@ class AIAgent:
                     preview = _build_tool_preview(function_name, function_args) or function_name
                     if len(preview) > 30:
                         preview = preview[:27] + "..."
-                    spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots')
+                    spinner = KawaiiSpinner(f"{face} {emoji} {preview}", spinner_type='dots', print_fn=self._print_fn)
                     spinner.start()
                 _spinner_result = None
                 try:
@@ -6019,7 +6110,7 @@ class AIAgent:
                     # Raw KawaiiSpinner only when no streaming consumers
                     # (would conflict with streamed token output)
                     spinner_type = random.choice(['brain', 'sparkle', 'pulse', 'moon', 'star'])
-                    thinking_spinner = KawaiiSpinner(f"{face} {verb}...", spinner_type=spinner_type)
+                    thinking_spinner = KawaiiSpinner(f"{face} {verb}...", spinner_type=spinner_type, print_fn=self._print_fn)
                     thinking_spinner.start()
             
             # Log request details if verbose
