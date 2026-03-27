@@ -283,7 +283,6 @@ from hermes_cli.config import (
     save_env_value,
     get_env_value,
     ensure_hermes_home,
-    DEFAULT_CONFIG,
 )
 
 from hermes_cli.colors import Colors, color
@@ -549,9 +548,9 @@ def _prompt_api_key(var: dict):
 
     if value:
         save_env_value(var["name"], value)
-        print_success(f"  ✓ Saved")
+        print_success("  ✓ Saved")
     else:
-        print_warning(f"  Skipped (configure later with 'hermes setup')")
+        print_warning("  Skipped (configure later with 'hermes setup')")
 
 
 def _print_setup_summary(config: dict, hermes_home):
@@ -726,9 +725,9 @@ def _print_setup_summary(config: dict, hermes_home):
         f"   {color('hermes config edit', Colors.GREEN)}    Open config in your editor"
     )
     print(f"   {color('hermes config set <key> <value>', Colors.GREEN)}")
-    print(f"                          Set a specific value")
+    print("                          Set a specific value")
     print()
-    print(f"   Or edit the files directly:")
+    print("   Or edit the files directly:")
     print(f"   {color(f'nano {get_config_path()}', Colors.DIM)}")
     print(f"   {color(f'nano {get_env_path()}', Colors.DIM)}")
     print()
@@ -756,13 +755,13 @@ def _prompt_container_resources(config: dict):
     print_info("  Persistent filesystem keeps files between sessions.")
     print_info("  Set to 'no' for ephemeral sandboxes that reset each time.")
     persist_str = prompt(
-        f"  Persist filesystem across sessions? (yes/no)", persist_label
+        "  Persist filesystem across sessions? (yes/no)", persist_label
     )
     terminal["container_persistent"] = persist_str.lower() in ("yes", "true", "y", "1")
 
     # CPU
     current_cpu = terminal.get("container_cpu", 1)
-    cpu_str = prompt(f"  CPU cores", str(current_cpu))
+    cpu_str = prompt("  CPU cores", str(current_cpu))
     try:
         terminal["container_cpu"] = float(cpu_str)
     except ValueError:
@@ -770,7 +769,7 @@ def _prompt_container_resources(config: dict):
 
     # Memory
     current_mem = terminal.get("container_memory", 5120)
-    mem_str = prompt(f"  Memory in MB (5120 = 5GB)", str(current_mem))
+    mem_str = prompt("  Memory in MB (5120 = 5GB)", str(current_mem))
     try:
         terminal["container_memory"] = int(mem_str)
     except ValueError:
@@ -778,7 +777,7 @@ def _prompt_container_resources(config: dict):
 
     # Disk
     current_disk = terminal.get("container_disk", 51200)
-    disk_str = prompt(f"  Disk in MB (51200 = 50GB)", str(current_disk))
+    disk_str = prompt("  Disk in MB (51200 = 50GB)", str(current_disk))
     try:
         terminal["container_disk"] = int(disk_str)
     except ValueError:
@@ -798,15 +797,11 @@ def setup_model_provider(config: dict):
     """Configure the inference provider and default model."""
     from hermes_cli.auth import (
         get_active_provider,
-        get_provider_auth_state,
         PROVIDER_REGISTRY,
-        format_auth_error,
-        AuthError,
         fetch_nous_models,
         resolve_nous_runtime_credentials,
         _update_config_for_provider,
         _login_openai_codex,
-        get_codex_auth_status,
         resolve_codex_runtime_credentials,
         DEFAULT_CODEX_BASE_URL,
         detect_external_credentials,
@@ -975,7 +970,7 @@ def setup_model_provider(config: dict):
         print()
 
         try:
-            from hermes_cli.auth import _login_nous, ProviderConfig
+            from hermes_cli.auth import _login_nous
             import argparse
 
             mock_args = argparse.Namespace(
@@ -3106,6 +3101,10 @@ def run_setup_wizard(args):
       hermes setup tools     — just tool configuration
       hermes setup agent     — just agent settings
     """
+    from hermes_cli.config import is_managed, managed_error
+    if is_managed():
+        managed_error("run setup wizard")
+        return
     ensure_hermes_home()
 
     config = load_config()
@@ -3235,12 +3234,17 @@ def run_setup_wizard(args):
             print_info("Exiting. Run 'hermes setup' again when ready.")
             return
         elif 3 <= choice <= 7:
-            # Individual section
-            section_idx = choice - 3
-            _, label, func = SETUP_SECTIONS[section_idx]
-            func(config)
-            save_config(config)
-            _print_setup_summary(config, hermes_home)
+            # Individual section — map by key, not by position.
+            # SETUP_SECTIONS includes TTS but the returning-user menu skips it,
+            # so positional indexing (choice - 3) would dispatch the wrong section.
+            _RETURNING_USER_SECTION_KEYS = ["model", "terminal", "gateway", "tools", "agent"]
+            section_key = _RETURNING_USER_SECTION_KEYS[choice - 3]
+            section = next((s for s in SETUP_SECTIONS if s[0] == section_key), None)
+            if section:
+                _, label, func = section
+                func(config)
+                save_config(config)
+                _print_setup_summary(config, hermes_home)
             return
     else:
         # ── First-Time Setup ──
@@ -3299,7 +3303,6 @@ def _run_quick_setup(config: dict, hermes_home):
         get_missing_env_vars,
         get_missing_config_fields,
         check_config_version,
-        migrate_config,
     )
 
     print()
@@ -3438,9 +3441,9 @@ def _run_quick_setup(config: dict, hermes_home):
                     value = prompt(f"  {var.get('prompt', var['name'])}")
                 if value:
                     save_env_value(var["name"], value)
-                    print_success(f"  ✓ Saved")
+                    print_success("  ✓ Saved")
                 else:
-                    print_warning(f"  Skipped")
+                    print_warning("  Skipped")
                 print()
 
     # Handle missing config fields

@@ -296,6 +296,9 @@ class MessageEvent:
     reply_to_message_id: Optional[str] = None
     reply_to_text: Optional[str] = None  # Text of the replied-to message (for context injection)
     
+    # Auto-loaded skill for topic/channel bindings (e.g., Telegram DM Topics)
+    auto_skill: Optional[str] = None
+    
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
@@ -819,6 +822,16 @@ class BasePlatformAdapter(ABC):
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
+        finally:
+            # Ensure the underlying platform typing loop is stopped.
+            # _keep_typing may have called send_typing() after an outer
+            # stop_typing() cleared the task dict, recreating the loop.
+            # Cancelling _keep_typing alone won't clean that up.
+            if hasattr(self, "stop_typing"):
+                try:
+                    await self.stop_typing(chat_id)
+                except Exception:
+                    pass
     
     async def handle_message(self, event: MessageEvent) -> None:
         """
@@ -1129,6 +1142,13 @@ class BasePlatformAdapter(ABC):
             try:
                 await typing_task
             except asyncio.CancelledError:
+                pass
+            # Also cancel any platform-level persistent typing tasks (e.g. Discord)
+            # that may have been recreated by _keep_typing after the last stop_typing()
+            try:
+                if hasattr(self, "stop_typing"):
+                    await self.stop_typing(event.source.chat_id)
+            except Exception:
                 pass
             # Clean up session tracking
             if session_key in self._active_sessions:

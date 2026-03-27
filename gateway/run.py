@@ -76,7 +76,8 @@ _ensure_ssl_certs()
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
-_hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+from hermes_constants import get_hermes_home
+_hermes_home = get_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -220,7 +221,7 @@ from gateway.session import (
     build_session_context_prompt,
     build_session_key,
 )
-from gateway.delivery import DeliveryRouter, DeliveryTarget
+from gateway.delivery import DeliveryRouter
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 
 logger = logging.getLogger(__name__)
@@ -256,7 +257,25 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
-def _resolve_gateway_model() -> str:
+def _platform_config_key(platform: "Platform") -> str:
+    """Map a Platform enum to its config.yaml key (LOCAL→"cli", rest→enum value)."""
+    return "cli" if platform == Platform.LOCAL else platform.value
+
+
+def _load_gateway_config() -> dict:
+    """Load and parse ~/.hermes/config.yaml, returning {} on any error."""
+    try:
+        config_path = _hermes_home / 'config.yaml'
+        if config_path.exists():
+            import yaml
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f) or {}
+    except Exception:
+        logger.debug("Could not load gateway config from %s", _hermes_home / 'config.yaml')
+    return {}
+
+
+def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from env/config — mirrors the resolution in _run_agent_sync.
 
     Without this, temporary AIAgent instances (memory flush, /compress) fall
@@ -264,19 +283,12 @@ def _resolve_gateway_model() -> str:
     when the active provider is openai-codex.
     """
     model = os.getenv("HERMES_MODEL") or os.getenv("LLM_MODEL") or "anthropic/claude-opus-4.6"
-    try:
-        import yaml as _y
-        _cfg_path = _hermes_home / "config.yaml"
-        if _cfg_path.exists():
-            with open(_cfg_path, encoding="utf-8") as _f:
-                _cfg = _y.safe_load(_f) or {}
-            _model_cfg = _cfg.get("model", {})
-            if isinstance(_model_cfg, str):
-                model = _model_cfg
-            elif isinstance(_model_cfg, dict):
-                model = _model_cfg.get("default", model)
-    except Exception:
-        pass
+    cfg = config if config is not None else _load_gateway_config()
+    model_cfg = cfg.get("model", {})
+    if isinstance(model_cfg, str):
+        model = model_cfg
+    elif isinstance(model_cfg, dict):
+        model = model_cfg.get("default", model)
     return model
 
 
@@ -805,6 +817,7 @@ class GatewayRunner:
         "medium", "low", "minimal", "none". Returns None to use default
         (medium).
         """
+        from hermes_constants import parse_reasoning_effort
         effort = ""
         try:
             import yaml as _y
@@ -817,16 +830,10 @@ class GatewayRunner:
             pass
         if not effort:
             effort = os.getenv("HERMES_REASONING_EFFORT", "")
-        if not effort:
-            return None
-        effort = effort.lower().strip()
-        if effort == "none":
-            return {"enabled": False}
-        valid = ("xhigh", "high", "medium", "low", "minimal")
-        if effort in valid:
-            return {"enabled": True, "effort": effort}
-        logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
-        return None
+        result = parse_reasoning_effort(effort)
+        if effort and effort.strip() and result is None:
+            logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
+        return result
 
     @staticmethod
     def _load_show_reasoning() -> bool:
@@ -1560,6 +1567,30 @@ class GatewayRunner:
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
 
+            # Resolve the command once for all early-intercept checks below.
+            from hermes_cli.commands import resolve_command as _resolve_cmd_inner
+            _evt_cmd = event.get_command()
+            _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+
+            # /stop must hard-kill the session when an agent is running.
+            # A soft interrupt (agent.interrupt()) doesn't help when the agent
+            # is truly hung — the executor thread is blocked and never checks
+            # _interrupt_requested.  Force-clean _running_agents so the session
+            # is unlocked and subsequent messages are processed normally.
+            if _cmd_def_inner and _cmd_def_inner.name == "stop":
+                running_agent = self._running_agents.get(_quick_key)
+                if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+                    running_agent.interrupt("Stop requested")
+                # Force-clean: remove the session lock regardless of agent state
+                adapter = self.adapters.get(source.platform)
+                if adapter and hasattr(adapter, 'get_pending_message'):
+                    adapter.get_pending_message(_quick_key)  # consume and discard
+                self._pending_messages.pop(_quick_key, None)
+                if _quick_key in self._running_agents:
+                    del self._running_agents[_quick_key]
+                logger.info("HARD STOP for session %s — session lock released", _quick_key[:20])
+                return "⚡ Force-stopped. The session is unlocked — you can send a new message."
+
             # /reset and /new must bypass the running-agent guard so they
             # actually dispatch as commands instead of being queued as user
             # text (which would be fed back to the agent with the same
@@ -1567,9 +1598,6 @@ class GatewayRunner:
             # clear the adapter's pending queue so the stale "/reset" text
             # doesn't get re-processed as a user message after the
             # interrupt completes.
-            from hermes_cli.commands import resolve_command as _resolve_cmd_inner
-            _evt_cmd = event.get_command()
-            _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
             if _cmd_def_inner and _cmd_def_inner.name == "new":
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
@@ -1627,8 +1655,11 @@ class GatewayRunner:
             if running_agent is _AGENT_PENDING_SENTINEL:
                 # Agent is being set up but not ready yet.
                 if event.get_command() == "stop":
-                    # Nothing to interrupt — agent hasn't started yet.
-                    return "⏳ The agent is still starting up — nothing to stop yet."
+                    # Force-clean the sentinel so the session is unlocked.
+                    if _quick_key in self._running_agents:
+                        del self._running_agents[_quick_key]
+                    logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key[:20])
+                    return "⚡ Force-stopped. The agent was still starting — session unlocked."
                 # Queue the message so it will be picked up after the
                 # agent starts.
                 adapter = self.adapters.get(source.platform)
@@ -1674,9 +1705,6 @@ class GatewayRunner:
         if canonical == "stop":
             return await self._handle_stop_command(event)
         
-        if canonical == "model":
-            return await self._handle_model_command(event)
-
         if canonical == "reasoning":
             return await self._handle_reasoning_command(event)
 
@@ -1940,7 +1968,39 @@ class GatewayRunner:
 
             session_entry.was_auto_reset = False
             session_entry.auto_reset_reason = None
-        
+
+        # Auto-load skill for DM topic bindings (e.g., Telegram Private Chat Topics)
+        # Only inject on NEW sessions — for ongoing conversations the skill content
+        # is already in the conversation history from the first message.
+        if _is_new_session and getattr(event, "auto_skill", None):
+            try:
+                from agent.skill_commands import _load_skill_payload, _build_skill_message
+                _skill_name = event.auto_skill
+                _loaded = _load_skill_payload(_skill_name, task_id=_quick_key)
+                if _loaded:
+                    _loaded_skill, _skill_dir, _display_name = _loaded
+                    _activation_note = (
+                        f'[SYSTEM: This conversation is in a topic with the "{_display_name}" skill '
+                        f"auto-loaded. Follow its instructions for the duration of this session.]"
+                    )
+                    _skill_msg = _build_skill_message(
+                        _loaded_skill, _skill_dir, _activation_note,
+                        user_instruction=event.text,
+                    )
+                    if _skill_msg:
+                        event.text = _skill_msg
+                        logger.info(
+                            "[Gateway] Auto-loaded skill '%s' for DM topic session %s",
+                            _skill_name, session_key,
+                        )
+                else:
+                    logger.warning(
+                        "[Gateway] DM topic skill '%s' not found in available skills",
+                        _skill_name,
+                    )
+            except Exception as e:
+                logger.warning("[Gateway] Failed to auto-load topic skill '%s': %s", event.auto_skill, e)
+
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
         
@@ -2394,7 +2454,8 @@ class GatewayRunner:
                 history=history,
                 source=source,
                 session_id=session_entry.session_id,
-                session_key=session_key
+                session_key=session_key,
+                event_message_id=event.message_id,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -2735,17 +2796,32 @@ class GatewayRunner:
         return "\n".join(lines)
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
-        """Handle /stop command - interrupt a running agent."""
+        """Handle /stop command - interrupt a running agent.
+
+        When an agent is truly hung (blocked thread that never checks
+        _interrupt_requested), the early intercept in _handle_message()
+        handles /stop before this method is reached.  This handler fires
+        only through normal command dispatch (no running agent) or as a
+        fallback.  Force-clean the session lock in all cases for safety.
+        """
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
-            return "⏳ The agent is still starting up — nothing to stop yet."
+            # Force-clean the sentinel so the session is unlocked.
+            if session_key in self._running_agents:
+                del self._running_agents[session_key]
+            logger.info("HARD STOP (pending) for session %s — sentinel cleared", session_key[:20])
+            return "⚡ Force-stopped. The agent was still starting — session unlocked."
         if agent:
-            agent.interrupt()
-            return "⚡ Stopping the current task... The agent will finish its current step and respond."
+            agent.interrupt("Stop requested")
+            # Force-clean the session lock so a truly hung agent doesn't
+            # keep it locked forever.
+            if session_key in self._running_agents:
+                del self._running_agents[session_key]
+            return "⚡ Force-stopped. The session is unlocked — you can send a new message."
         else:
             return "No active task to stop."
     
@@ -2767,198 +2843,6 @@ class GatewayRunner:
             pass
         return "\n".join(lines)
     
-    async def _handle_model_command(self, event: MessageEvent) -> str:
-        """Handle /model command - show or change the current model."""
-        import yaml
-        from hermes_cli.models import (
-            parse_model_input,
-            validate_requested_model,
-            curated_models_for_provider,
-            normalize_provider,
-            _PROVIDER_LABELS,
-        )
-
-        args = event.get_command_args().strip()
-        config_path = _hermes_home / 'config.yaml'
-
-        # Resolve current model and provider from config
-        current = os.getenv("HERMES_MODEL") or "anthropic/claude-opus-4.6"
-        current_provider = "openrouter"
-        try:
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    cfg = yaml.safe_load(f) or {}
-                model_cfg = cfg.get("model", {})
-                if isinstance(model_cfg, str):
-                    current = model_cfg
-                elif isinstance(model_cfg, dict):
-                    current = model_cfg.get("default", current)
-                    current_provider = model_cfg.get("provider", current_provider)
-        except Exception:
-            pass
-
-        # Resolve "auto" to the actual provider using credential detection
-        current_provider = normalize_provider(current_provider)
-        if current_provider == "auto":
-            try:
-                from hermes_cli.auth import resolve_provider as _resolve_provider
-                current_provider = _resolve_provider(current_provider)
-            except Exception:
-                current_provider = "openrouter"
-
-        # Detect custom endpoint: provider resolved to openrouter but a custom
-        # base URL is configured — the user set up a custom endpoint.
-        if current_provider == "openrouter" and os.getenv("OPENAI_BASE_URL", "").strip():
-            current_provider = "custom"
-
-        if not args:
-            # If a fallback model is active, show it instead of config
-            if self._effective_model:
-                eff_provider = self._effective_provider or 'unknown'
-                eff_label = _PROVIDER_LABELS.get(eff_provider, eff_provider)
-                cfg_label = _PROVIDER_LABELS.get(current_provider, current_provider)
-                lines = [
-                    f"🤖 **Active model:** `{self._effective_model}` (fallback)",
-                    f"**Provider:** {eff_label}",
-                    f"**Primary model** (`{current}` via {cfg_label}) is rate-limited.",
-                    "",
-                ]
-                lines.append("To change: `/model model-name`")
-                lines.append("Switch provider: `/model provider:model-name`")
-                return "\n".join(lines)
-
-            provider_label = _PROVIDER_LABELS.get(current_provider, current_provider)
-            lines = [
-                f"🤖 **Current model:** `{current}`",
-                f"**Provider:** {provider_label}",
-            ]
-            # Show custom endpoint URL when using a custom provider
-            if current_provider == "custom":
-                from hermes_cli.models import _get_custom_base_url
-                custom_url = _get_custom_base_url() or os.getenv("OPENAI_BASE_URL", "")
-                if custom_url:
-                    lines.append(f"**Endpoint:** `{custom_url}`")
-            lines.append("")
-            curated = curated_models_for_provider(current_provider)
-            if curated:
-                lines.append(f"**Available models ({provider_label}):**")
-                for mid, desc in curated:
-                    marker = " ←" if mid == current else ""
-                    label = f"  _{desc}_" if desc else ""
-                    lines.append(f"• `{mid}`{label}{marker}")
-                lines.append("")
-            lines.append("To change: `/model model-name`")
-            lines.append("Switch provider: `/model provider-name` or `/model provider:model-name`")
-            return "\n".join(lines)
-
-        # Handle bare "/model custom" — switch to custom provider
-        # and auto-detect the model from the endpoint.
-        if args.strip().lower() == "custom":
-            from hermes_cli.model_switch import switch_to_custom_provider
-            cust_result = switch_to_custom_provider()
-            if not cust_result.success:
-                return f"⚠️ {cust_result.error_message}"
-            try:
-                user_config = {}
-                if config_path.exists():
-                    with open(config_path, encoding="utf-8") as f:
-                        user_config = yaml.safe_load(f) or {}
-                if "model" not in user_config or not isinstance(user_config["model"], dict):
-                    user_config["model"] = {}
-                user_config["model"]["default"] = cust_result.model
-                user_config["model"]["provider"] = "custom"
-                user_config["model"]["base_url"] = cust_result.base_url
-                with open(config_path, 'w', encoding="utf-8") as f:
-                    yaml.dump(user_config, f, default_flow_style=False, sort_keys=False)
-            except Exception as e:
-                return f"⚠️ Failed to save model change: {e}"
-            os.environ["HERMES_MODEL"] = cust_result.model
-            os.environ["HERMES_INFERENCE_PROVIDER"] = "custom"
-            self._effective_model = None
-            self._effective_provider = None
-            return (
-                f"🤖 Model changed to `{cust_result.model}` (saved to config)\n"
-                f"**Provider:** Custom\n"
-                f"**Endpoint:** `{cust_result.base_url}`\n"
-                f"_Model auto-detected from endpoint. Takes effect on next message._"
-            )
-
-        # Core model-switching pipeline (shared with CLI)
-        from hermes_cli.model_switch import switch_model
-
-        # Resolve current base_url for is_custom detection
-        _resolved_base = ""
-        try:
-            from hermes_cli.runtime_provider import resolve_runtime_provider as _rtp
-            _resolved_base = _rtp(requested=current_provider).get("base_url", "")
-        except Exception:
-            pass
-
-        result = switch_model(
-            args,
-            current_provider,
-            current_base_url=_resolved_base,
-            current_api_key=os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or "",
-        )
-
-        if not result.success:
-            msg = result.error_message
-            tip = "\n\nUse `/model` to see available models, `/provider` to see providers" if "Did you mean" not in msg else ""
-            return f"⚠️ {msg}{tip}"
-
-        # Persist to config only if validation approves
-        if result.persist:
-            try:
-                user_config = {}
-                if config_path.exists():
-                    with open(config_path, encoding="utf-8") as f:
-                        user_config = yaml.safe_load(f) or {}
-                if "model" not in user_config or not isinstance(user_config["model"], dict):
-                    user_config["model"] = {}
-                user_config["model"]["default"] = result.new_model
-                if result.provider_changed:
-                    user_config["model"]["provider"] = result.target_provider
-                    # Persist base_url for custom endpoints; clear when
-                    # switching away from custom (#2562 Phase 2).
-                    if result.base_url and "openrouter.ai" not in (result.base_url or ""):
-                        user_config["model"]["base_url"] = result.base_url
-                    else:
-                        user_config["model"].pop("base_url", None)
-                with open(config_path, 'w', encoding="utf-8") as f:
-                    yaml.dump(user_config, f, default_flow_style=False, sort_keys=False)
-            except Exception as e:
-                return f"⚠️ Failed to save model change: {e}"
-
-        # Set env vars so the next agent run picks up the change
-        os.environ["HERMES_MODEL"] = result.new_model
-        if result.provider_changed:
-            os.environ["HERMES_INFERENCE_PROVIDER"] = result.target_provider
-
-        provider_note = f"\n**Provider:** {result.provider_label}" if result.provider_changed else ""
-
-        warning = ""
-        if result.warning_message:
-            warning = f"\n⚠️ {result.warning_message}"
-
-        persist_note = "saved to config" if result.persist else "this session only — will revert on restart"
-
-        # Clear fallback state since user explicitly chose a model
-        self._effective_model = None
-        self._effective_provider = None
-
-        # Show endpoint info for custom providers
-        custom_hint = ""
-        if result.is_custom_target:
-            endpoint = result.base_url or _resolved_base or "custom endpoint"
-            custom_hint = f"\n**Endpoint:** `{endpoint}`"
-            if not result.provider_changed:
-                custom_hint += (
-                    "\n_To switch providers, use_ `/model provider:model`"
-                    "\n_e.g._ `/model openrouter:anthropic/claude-sonnet-4`"
-                )
-
-        return f"🤖 Model changed to `{result.new_model}` ({persist_note}){provider_note}{warning}{custom_hint}\n_(takes effect on next message)_"
-
     async def _handle_provider_command(self, event: MessageEvent) -> str:
         """Handle /provider command - show available providers."""
         import yaml
@@ -3044,7 +2928,7 @@ class GatewayRunner:
                 else:
                     preview = prompt[:50] + "..." if len(prompt) > 50 else prompt
                 lines.append(f"• `{name}` — {preview}")
-            lines.append(f"\nUsage: `/personality <name>`")
+            lines.append("\nUsage: `/personality <name>`")
             return "\n".join(lines)
 
         def _resolve_prompt(value):
@@ -3698,52 +3582,12 @@ class GatewayRunner:
                 )
                 return
 
-            # Read model from config via shared helper
-            model = _resolve_gateway_model()
+            user_config = _load_gateway_config()
+            model = _resolve_gateway_model(user_config)
+            platform_key = _platform_config_key(source.platform)
 
-            # Determine toolset (same logic as _run_agent)
-            default_toolset_map = {
-                Platform.LOCAL: "hermes-cli",
-                Platform.TELEGRAM: "hermes-telegram",
-                Platform.DISCORD: "hermes-discord",
-                Platform.WHATSAPP: "hermes-whatsapp",
-                Platform.SLACK: "hermes-slack",
-                Platform.SIGNAL: "hermes-signal",
-                Platform.HOMEASSISTANT: "hermes-homeassistant",
-                Platform.EMAIL: "hermes-email",
-                Platform.DINGTALK: "hermes-dingtalk",
-            }
-            platform_toolsets_config = {}
-            try:
-                config_path = _hermes_home / 'config.yaml'
-                if config_path.exists():
-                    import yaml
-                    with open(config_path, 'r', encoding="utf-8") as f:
-                        user_config = yaml.safe_load(f) or {}
-                    platform_toolsets_config = user_config.get("platform_toolsets", {})
-            except Exception:
-                pass
-
-            platform_config_key = {
-                Platform.LOCAL: "cli",
-                Platform.TELEGRAM: "telegram",
-                Platform.DISCORD: "discord",
-                Platform.WHATSAPP: "whatsapp",
-                Platform.SLACK: "slack",
-                Platform.SIGNAL: "signal",
-                Platform.HOMEASSISTANT: "homeassistant",
-                Platform.EMAIL: "email",
-                Platform.DINGTALK: "dingtalk",
-            }.get(source.platform, "telegram")
-
-            config_toolsets = platform_toolsets_config.get(platform_config_key)
-            if config_toolsets and isinstance(config_toolsets, list):
-                enabled_toolsets = config_toolsets
-            else:
-                default_toolset = default_toolset_map.get(source.platform, "hermes-telegram")
-                enabled_toolsets = [default_toolset]
-
-            platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
+            from hermes_cli.tools_config import _get_platform_tools
+            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
@@ -4811,10 +4655,18 @@ class GatewayRunner:
         prompt cache hits.
         """
         import hashlib, json as _j
+
+        # Fingerprint the FULL credential string instead of using a short
+        # prefix. OAuth/JWT-style tokens frequently share a common prefix
+        # (e.g. "eyJhbGci"), which can cause false cache hits across auth
+        # switches if only the first few characters are considered.
+        _api_key = str(runtime.get("api_key", "") or "")
+        _api_key_fingerprint = hashlib.sha256(_api_key.encode()).hexdigest() if _api_key else ""
+
         blob = _j.dumps(
             [
                 model,
-                runtime.get("api_key", "")[:8],  # first 8 chars only
+                _api_key_fingerprint,
                 runtime.get("base_url", ""),
                 runtime.get("provider", ""),
                 runtime.get("api_mode", ""),
@@ -4844,6 +4696,7 @@ class GatewayRunner:
         session_id: str,
         session_key: str = None,
         _interrupt_depth: int = 0,
+        event_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -4860,67 +4713,16 @@ class GatewayRunner:
         from run_agent import AIAgent
         import queue
         
-        # Determine toolset based on platform.
-        # Check config.yaml for per-platform overrides, fallback to hardcoded defaults.
-        default_toolset_map = {
-            Platform.LOCAL: "hermes-cli",
-            Platform.TELEGRAM: "hermes-telegram",
-            Platform.DISCORD: "hermes-discord",
-            Platform.WHATSAPP: "hermes-whatsapp",
-            Platform.SLACK: "hermes-slack",
-            Platform.SIGNAL: "hermes-signal",
-            Platform.HOMEASSISTANT: "hermes-homeassistant",
-            Platform.EMAIL: "hermes-email",
-            Platform.DINGTALK: "hermes-dingtalk",
-        }
+        user_config = _load_gateway_config()
+        platform_key = _platform_config_key(source.platform)
 
-        # Try to load platform_toolsets from config
-        platform_toolsets_config = {}
-        try:
-            config_path = _hermes_home / 'config.yaml'
-            if config_path.exists():
-                import yaml
-                with open(config_path, 'r', encoding="utf-8") as f:
-                    user_config = yaml.safe_load(f) or {}
-                platform_toolsets_config = user_config.get("platform_toolsets", {})
-        except Exception as e:
-            logger.debug("Could not load platform_toolsets config: %s", e)
+        from hermes_cli.tools_config import _get_platform_tools
+        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
-        # Map platform enum to config key
-        platform_config_key = {
-            Platform.LOCAL: "cli",
-            Platform.TELEGRAM: "telegram",
-            Platform.DISCORD: "discord",
-            Platform.WHATSAPP: "whatsapp",
-            Platform.SLACK: "slack",
-            Platform.SIGNAL: "signal",
-            Platform.HOMEASSISTANT: "homeassistant",
-            Platform.EMAIL: "email",
-            Platform.DINGTALK: "dingtalk",
-        }.get(source.platform, "telegram")
-        
-        # Use config override if present (list of toolsets), otherwise hardcoded default
-        config_toolsets = platform_toolsets_config.get(platform_config_key)
-        if config_toolsets and isinstance(config_toolsets, list):
-            enabled_toolsets = config_toolsets
-        else:
-            default_toolset = default_toolset_map.get(source.platform, "hermes-telegram")
-            enabled_toolsets = [default_toolset]
-        
         # Tool progress mode from config.yaml: "all", "new", "verbose", "off"
         # Falls back to env vars for backward compatibility
-        _progress_cfg = {}
-        try:
-            _tp_cfg_path = _hermes_home / "config.yaml"
-            if _tp_cfg_path.exists():
-                import yaml as _tp_yaml
-                with open(_tp_cfg_path, encoding="utf-8") as _tp_f:
-                    _tp_data = _tp_yaml.safe_load(_tp_f) or {}
-                _progress_cfg = _tp_data.get("display", {})
-        except Exception:
-            pass
         progress_mode = (
-            _progress_cfg.get("tool_progress")
+            user_config.get("display", {}).get("tool_progress")
             or os.getenv("HERMES_TOOL_PROGRESS_MODE")
             or "all"
         )
@@ -4980,7 +4782,12 @@ class GatewayRunner:
         
         # Background task to send progress messages
         # Accumulates tool lines into a single message that gets edited
-        _progress_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        # For DM top-level Slack messages, source.thread_id is None but the
+        # final reply will be threaded under the original message via reply_to.
+        # Use event_message_id as fallback so progress messages land in the
+        # same thread as the final response instead of going to the DM root.
+        _progress_thread_id = source.thread_id or event_message_id
+        _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
         async def send_progress_messages():
             if not progress_queue:
@@ -5095,7 +4902,7 @@ class GatewayRunner:
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
-        _status_thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter:
@@ -5138,7 +4945,7 @@ class GatewayRunner:
             except Exception:
                 pass
 
-            model = _resolve_gateway_model()
+            model = _resolve_gateway_model(user_config)
 
             try:
                 runtime_kwargs = _resolve_runtime_agent_kwargs()
@@ -5176,7 +4983,7 @@ class GatewayRunner:
                             adapter=_adapter,
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
-                            metadata={"thread_id": source.thread_id} if source.thread_id else None,
+                            metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
                         )
                         _stream_delta_cb = _stream_consumer.on_delta
                         stream_consumer_holder[0] = _stream_consumer
@@ -5288,7 +5095,18 @@ class GatewayRunner:
                         if msg.get("mirror"):
                             mirror_src = msg.get("mirror_source", "another session")
                             content = f"[Delivered from {mirror_src}] {content}"
-                        agent_history.append({"role": role, "content": content})
+                        entry = {"role": role, "content": content}
+                        # Preserve reasoning fields on assistant messages so
+                        # multi-turn reasoning context survives session reload.
+                        # The agent's _build_api_kwargs converts these to the
+                        # provider-specific format (reasoning_content, etc.).
+                        if role == "assistant":
+                            for _rkey in ("reasoning", "reasoning_details",
+                                          "codex_reasoning_items"):
+                                _rval = msg.get(_rkey)
+                                if _rval:
+                                    entry[_rkey] = _rval
+                        agent_history.append(entry)
             
             # Collect MEDIA paths already in history so we can exclude them
             # from the current turn's extraction. This is compression-safe:
@@ -5727,7 +5545,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             except Exception:
                 pass
         else:
-            hermes_home = os.getenv("HERMES_HOME", "~/.hermes")
+            hermes_home = str(get_hermes_home())
             logger.error(
                 "Another gateway instance is already running (PID %d, HERMES_HOME=%s). "
                 "Use 'hermes gateway restart' to replace it, or 'hermes gateway stop' first.",

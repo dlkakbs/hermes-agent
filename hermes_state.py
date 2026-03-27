@@ -21,12 +21,13 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
 
 
-DEFAULT_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
+DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -73,7 +74,10 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_name TEXT,
     timestamp REAL NOT NULL,
     token_count INTEGER,
-    finish_reason TEXT
+    finish_reason TEXT,
+    reasoning TEXT,
+    reasoning_details TEXT,
+    codex_reasoning_items TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -120,7 +124,10 @@ class SessionDB:
         self._conn = sqlite3.connect(
             str(self.db_path),
             check_same_thread=False,
-            timeout=10.0,
+            # 30s gives the WAL writer (CLI or gateway) time to finish a batch
+            # flush before the concurrent reader/writer gives up.  10s was too
+            # short when the CLI is doing frequent memory flushes.
+            timeout=30.0,
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -189,6 +196,25 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass
                 cursor.execute("UPDATE schema_version SET version = 5")
+            if current_version < 6:
+                # v6: add reasoning columns to messages table — preserves assistant
+                # reasoning text and structured reasoning_details across gateway
+                # session turns.  Without these, reasoning chains are lost on
+                # session reload, breaking multi-turn reasoning continuity for
+                # providers that replay reasoning (OpenRouter, OpenAI, Nous).
+                for col_name, col_type in [
+                    ("reasoning", "TEXT"),
+                    ("reasoning_details", "TEXT"),
+                    ("codex_reasoning_items", "TEXT"),
+                ]:
+                    try:
+                        safe = col_name.replace('"', '""')
+                        cursor.execute(
+                            f'ALTER TABLE messages ADD COLUMN "{safe}" {col_type}'
+                        )
+                    except sqlite3.OperationalError:
+                        pass  # Column already exists
+                cursor.execute("UPDATE schema_version SET version = 6")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -232,7 +258,7 @@ class SessionDB:
         """Create a new session record. Returns the session_id."""
         with self._lock:
             self._conn.execute(
-                """INSERT INTO sessions (id, source, user_id, model, model_config,
+                """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
                    system_prompt, parent_session_id, started_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
@@ -325,6 +351,27 @@ class SessionDB:
                     model,
                     session_id,
                 ),
+            )
+            self._conn.commit()
+
+    def ensure_session(
+        self,
+        session_id: str,
+        source: str = "unknown",
+        model: str = None,
+    ) -> None:
+        """Ensure a session row exists, creating it with minimal metadata if absent.
+
+        Used by _flush_messages_to_session_db to recover from a failed
+        create_session() call (e.g. transient SQLite lock at agent startup).
+        INSERT OR IGNORE is safe to call even when the row already exists.
+        """
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR IGNORE INTO sessions
+                   (id, source, model, started_at)
+                   VALUES (?, ?, ?, ?)""",
+                (session_id, source, model, time.time()),
             )
             self._conn.commit()
 
@@ -587,6 +634,9 @@ class SessionDB:
         tool_call_id: str = None,
         token_count: int = None,
         finish_reason: str = None,
+        reasoning: str = None,
+        reasoning_details: Any = None,
+        codex_reasoning_items: Any = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -595,10 +645,20 @@ class SessionDB:
         if role is 'tool' or tool_calls is present).
         """
         with self._lock:
+            # Serialize structured fields to JSON for storage
+            reasoning_details_json = (
+                json.dumps(reasoning_details)
+                if reasoning_details else None
+            )
+            codex_items_json = (
+                json.dumps(codex_reasoning_items)
+                if codex_reasoning_items else None
+            )
             cursor = self._conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, timestamp, token_count, finish_reason)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   tool_calls, tool_name, timestamp, token_count, finish_reason,
+                   reasoning, reasoning_details, codex_reasoning_items)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -609,6 +669,9 @@ class SessionDB:
                     time.time(),
                     token_count,
                     finish_reason,
+                    reasoning,
+                    reasoning_details_json,
+                    codex_items_json,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -660,7 +723,8 @@ class SessionDB:
         """
         with self._lock:
             cursor = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name "
+                "SELECT role, content, tool_call_id, tool_calls, tool_name, "
+                "reasoning, reasoning_details, codex_reasoning_items "
                 "FROM messages WHERE session_id = ? ORDER BY timestamp, id",
                 (session_id,),
             )
@@ -677,6 +741,22 @@ class SessionDB:
                     msg["tool_calls"] = json.loads(row["tool_calls"])
                 except (json.JSONDecodeError, TypeError):
                     pass
+            # Restore reasoning fields on assistant messages so providers
+            # that replay reasoning (OpenRouter, OpenAI, Nous) receive
+            # coherent multi-turn reasoning context.
+            if row["role"] == "assistant":
+                if row["reasoning"]:
+                    msg["reasoning"] = row["reasoning"]
+                if row["reasoning_details"]:
+                    try:
+                        msg["reasoning_details"] = json.loads(row["reasoning_details"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                if row["codex_reasoning_items"]:
+                    try:
+                        msg["codex_reasoning_items"] = json.loads(row["codex_reasoning_items"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
             messages.append(msg)
         return messages
 
@@ -806,9 +886,11 @@ class SessionDB:
                 return []
             matches = [dict(row) for row in cursor.fetchall()]
 
-            # Add surrounding context (1 message before + after each match)
-            for match in matches:
-                try:
+        # Add surrounding context (1 message before + after each match).
+        # Done outside the lock so we don't hold it across N sequential queries.
+        for match in matches:
+            try:
+                with self._lock:
                     ctx_cursor = self._conn.execute(
                         """SELECT role, content FROM messages
                            WHERE session_id = ? AND id >= ? - 1 AND id <= ? + 1
@@ -819,9 +901,9 @@ class SessionDB:
                         {"role": r["role"], "content": (r["content"] or "")[:200]}
                         for r in ctx_cursor.fetchall()
                     ]
-                    match["context"] = context_msgs
-                except Exception:
-                    match["context"] = []
+                match["context"] = context_msgs
+            except Exception:
+                match["context"] = []
 
         # Remove full content from result (snippet is enough, saves tokens)
         for match in matches:
