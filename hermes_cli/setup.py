@@ -12,7 +12,6 @@ Config files are stored in ~/.hermes/ for easy access.
 """
 
 import importlib.util
-import json
 import logging
 import os
 import shutil
@@ -132,7 +131,6 @@ def _set_reasoning_effort(config: Dict[str, Any], effort: str) -> None:
 
 # Import config helpers
 from hermes_cli.config import (
-    cfg_get,
     DEFAULT_CONFIG,
     get_hermes_home,
     get_config_path,
@@ -140,7 +138,6 @@ from hermes_cli.config import (
     load_config,
     save_config,
     save_env_value,
-    remove_env_value,
     get_env_value,
     ensure_hermes_home,
 )
@@ -444,7 +441,7 @@ def _print_setup_summary(config: dict, hermes_home):
             tool_status.append(("Image Generation", False, "FAL_KEY or OPENAI_API_KEY"))
 
     # TTS — show configured provider
-    tts_provider = cfg_get(config, "tts", "provider", default="edge")
+    tts_provider = config.get("tts", {}).get("provider", "edge")
     if subscription_features.tts.managed_by_nous:
         tool_status.append(("Text-to-Speech (OpenAI via Nous subscription)", True, None))
     elif tts_provider == "elevenlabs" and get_env_value("ELEVENLABS_API_KEY"):
@@ -483,7 +480,7 @@ def _print_setup_summary(config: dict, hermes_home):
 
     if subscription_features.modal.managed_by_nous:
         tool_status.append(("Modal Execution (Nous subscription)", True, None))
-    elif cfg_get(config, "terminal", "backend") == "modal":
+    elif config.get("terminal", {}).get("backend") == "modal":
         if subscription_features.modal.direct_override:
             tool_status.append(("Modal Execution (direct Modal)", True, None))
         else:
@@ -502,15 +499,6 @@ def _print_setup_summary(config: dict, hermes_home):
     # Home Assistant
     if get_env_value("HASS_TOKEN"):
         tool_status.append(("Smart Home (Home Assistant)", True, None))
-
-    # Spotify (OAuth via hermes auth spotify — check auth.json, not env vars)
-    try:
-        from hermes_cli.auth import get_provider_auth_state
-        _spotify_state = get_provider_auth_state("spotify") or {}
-        if _spotify_state.get("access_token") or _spotify_state.get("refresh_token"):
-            tool_status.append(("Spotify (PKCE OAuth)", True, None))
-    except Exception:
-        pass
 
     # Skills Hub
     if get_env_value("GITHUB_TOKEN"):
@@ -657,102 +645,6 @@ def _prompt_container_resources(config: dict):
         pass
 
 
-def _prompt_vercel_sandbox_settings(config: dict):
-    """Prompt for Vercel Sandbox settings without exposing unsupported disk sizing."""
-    terminal = config.setdefault("terminal", {})
-
-    print()
-    print_info("Vercel Sandbox settings:")
-    print_info("  Filesystem persistence uses Vercel snapshots.")
-    print_info("  Snapshots restore files only; live processes do not continue after sandbox recreation.")
-
-    from tools.terminal_tool import _SUPPORTED_VERCEL_RUNTIMES
-
-    current_runtime = terminal.get("vercel_runtime") or "node24"
-    supported_label = ", ".join(_SUPPORTED_VERCEL_RUNTIMES)
-    runtime = prompt(f"  Runtime ({supported_label})", current_runtime).strip() or current_runtime
-    if runtime not in _SUPPORTED_VERCEL_RUNTIMES:
-        print_warning(f"Unsupported Vercel runtime '{runtime}', keeping {current_runtime}.")
-        runtime = current_runtime if current_runtime in _SUPPORTED_VERCEL_RUNTIMES else "node24"
-    terminal["vercel_runtime"] = runtime
-    save_env_value("TERMINAL_VERCEL_RUNTIME", runtime)
-
-    current_persist = terminal.get("container_persistent", True)
-    persist_label = "yes" if current_persist else "no"
-    terminal["container_persistent"] = prompt(
-        "  Persist filesystem with snapshots? (yes/no)", persist_label
-    ).lower() in ("yes", "true", "y", "1")
-
-    current_cpu = terminal.get("container_cpu", 1)
-    cpu_str = prompt("  CPU cores", str(current_cpu))
-    try:
-        terminal["container_cpu"] = float(cpu_str)
-    except ValueError:
-        pass
-
-    current_mem = terminal.get("container_memory", 5120)
-    mem_str = prompt("  Memory in MB (5120 = 5GB)", str(current_mem))
-    try:
-        terminal["container_memory"] = int(mem_str)
-    except ValueError:
-        pass
-
-    if terminal.get("container_disk", 51200) not in (0, 51200):
-        print_warning("Vercel Sandbox does not support custom disk sizing; resetting container_disk to 51200.")
-    terminal["container_disk"] = 51200
-
-    print()
-    print_info("Vercel authentication:")
-    print_info("  Use a long-lived Vercel access token plus project/team IDs.")
-    linked_project = _read_nearest_vercel_project()
-    if linked_project:
-        print_info("  Found defaults in nearest .vercel/project.json.")
-
-    remove_env_value("VERCEL_OIDC_TOKEN")
-    token = prompt("    Vercel access token", get_env_value("VERCEL_TOKEN") or "", password=True)
-    project = prompt(
-        "    Vercel project ID",
-        get_env_value("VERCEL_PROJECT_ID") or linked_project.get("projectId", ""),
-    )
-    team = prompt(
-        "    Vercel team ID",
-        get_env_value("VERCEL_TEAM_ID") or linked_project.get("orgId", ""),
-    )
-    if token:
-        save_env_value("VERCEL_TOKEN", token)
-    if project:
-        save_env_value("VERCEL_PROJECT_ID", project)
-    if team:
-        save_env_value("VERCEL_TEAM_ID", team)
-
-
-def _read_nearest_vercel_project(start: Path | None = None) -> dict[str, str]:
-    """Read project/team defaults from the nearest Vercel link file."""
-    current = (start or Path.cwd()).resolve()
-    if current.is_file():
-        current = current.parent
-
-    for directory in (current, *current.parents):
-        project_file = directory / ".vercel" / "project.json"
-        if not project_file.exists():
-            continue
-        try:
-            data = json.loads(project_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-        if not isinstance(data, dict):
-            return {}
-        return {
-            key: value
-            for key, value in {
-                "projectId": data.get("projectId"),
-                "orgId": data.get("orgId"),
-            }.items()
-            if isinstance(value, str) and value.strip()
-        }
-    return {}
-
-
 # Tool categories and provider config are now in tools_config.py (shared
 # between `hermes tools` and `hermes setup tools`).
 
@@ -810,6 +702,8 @@ def setup_model_provider(config: dict, *, quick: bool = False):
     _m = config.get("model")
     if isinstance(_m, dict):
         selected_provider = _m.get("provider")
+
+    nous_subscription_selected = selected_provider == "nous"
 
     # ── Same-provider fallback & rotation setup (full setup only) ──
     if not quick and _supports_same_provider_pool_setup(selected_provider):
@@ -1190,13 +1084,6 @@ def _setup_tts_provider(config: dict):
                     "Falling back to Edge TTS."
                 )
                 selected = "edge"
-        if selected == "xai":
-            print()
-            voice_id = prompt("xAI voice_id (Enter for 'eve', or paste a custom voice ID)")
-            if voice_id and voice_id.strip():
-                config.setdefault("tts", {}).setdefault("xai", {})["voice_id"] = voice_id.strip()
-                print_success(f"xAI voice_id set to: {voice_id.strip()}")
-
 
     elif selected == "minimax":
         existing = get_env_value("MINIMAX_API_KEY")
@@ -1285,7 +1172,7 @@ def setup_terminal_backend(config: dict):
     print_info(f"   Guide: {_DOCS_BASE}/developer-guide/environments")
     print()
 
-    current_backend = cfg_get(config, "terminal", "backend", default="local")
+    current_backend = config.get("terminal", {}).get("backend", "local")
     is_linux = _platform.system() == "Linux"
 
     # Build backend choices with descriptions
@@ -1295,12 +1182,11 @@ def setup_terminal_backend(config: dict):
         "Modal - serverless cloud sandbox",
         "SSH - run on a remote machine",
         "Daytona - persistent cloud development environment",
-        "Vercel Sandbox - cloud microVM with snapshot filesystem persistence",
     ]
-    idx_to_backend = {0: "local", 1: "docker", 2: "modal", 3: "ssh", 4: "daytona", 5: "vercel_sandbox"}
-    backend_to_idx = {"local": 0, "docker": 1, "modal": 2, "ssh": 3, "daytona": 4, "vercel_sandbox": 5}
+    idx_to_backend = {0: "local", 1: "docker", 2: "modal", 3: "ssh", 4: "daytona"}
+    backend_to_idx = {"local": 0, "docker": 1, "modal": 2, "ssh": 3, "daytona": 4}
 
-    next_idx = 6
+    next_idx = 5
     if is_linux:
         terminal_choices.append("Singularity/Apptainer - HPC-friendly container")
         idx_to_backend[next_idx] = "singularity"
@@ -1335,7 +1221,7 @@ def setup_terminal_backend(config: dict):
         print_info(
             "  the agent starts. CLI mode always starts in the current directory."
         )
-        current_cwd = cfg_get(config, "terminal", "cwd", default="")
+        current_cwd = config.get("terminal", {}).get("cwd", "")
         cwd = prompt("  Messaging working directory", current_cwd or str(Path.home()))
         if cwd:
             config["terminal"]["cwd"] = cwd
@@ -1366,7 +1252,9 @@ def setup_terminal_backend(config: dict):
             print_info(f"Docker found: {docker_bin}")
 
         # Docker image
-        current_image = cfg_get(config, "terminal", "docker_image", default="nikolaik/python-nodejs:python3.11-nodejs20")
+        current_image = config.get("terminal", {}).get(
+            "docker_image", "nikolaik/python-nodejs:python3.11-nodejs20"
+        )
         image = prompt("  Docker image", current_image)
         config["terminal"]["docker_image"] = image
         save_env_value("TERMINAL_DOCKER_IMAGE", image)
@@ -1386,7 +1274,9 @@ def setup_terminal_backend(config: dict):
         else:
             print_info(f"Found: {sing_bin}")
 
-        current_image = cfg_get(config, "terminal", "singularity_image", default="docker://nikolaik/python-nodejs:python3.11-nodejs20")
+        current_image = config.get("terminal", {}).get(
+            "singularity_image", "docker://nikolaik/python-nodejs:python3.11-nodejs20"
+        )
         image = prompt("  Container image", current_image)
         config["terminal"]["singularity_image"] = image
         save_env_value("TERMINAL_SINGULARITY_IMAGE", image)
@@ -1405,7 +1295,7 @@ def setup_terminal_backend(config: dict):
             get_nous_subscription_features(config).nous_auth_present
             and is_managed_tool_gateway_ready("modal")
         )
-        modal_mode = normalize_modal_mode(cfg_get(config, "terminal", "modal_mode"))
+        modal_mode = normalize_modal_mode(config.get("terminal", {}).get("modal_mode"))
         use_managed_modal = False
         if managed_modal_available:
             modal_choices = [
@@ -1542,45 +1432,14 @@ def setup_terminal_backend(config: dict):
                 print_success("    Configured")
 
         # Daytona image
-        current_image = cfg_get(config, "terminal", "daytona_image", default="nikolaik/python-nodejs:python3.11-nodejs20")
+        current_image = config.get("terminal", {}).get(
+            "daytona_image", "nikolaik/python-nodejs:python3.11-nodejs20"
+        )
         image = prompt("  Sandbox image", current_image)
         config["terminal"]["daytona_image"] = image
         save_env_value("TERMINAL_DAYTONA_IMAGE", image)
 
         _prompt_container_resources(config)
-
-    elif selected_backend == "vercel_sandbox":
-        print_success("Terminal backend: Vercel Sandbox")
-        print_info("Cloud microVM sandboxes with snapshot-backed filesystem persistence.")
-        print_info("Requires the optional SDK: pip install 'hermes-agent[vercel]'")
-
-        try:
-            __import__("vercel")
-        except ImportError:
-            print_info("Installing vercel SDK...")
-            import subprocess
-
-            uv_bin = shutil.which("uv")
-            if uv_bin:
-                result = subprocess.run(
-                    [uv_bin, "pip", "install", "--python", sys.executable, "vercel"],
-                    capture_output=True,
-                    text=True,
-                )
-            else:
-                result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "vercel"],
-                    capture_output=True,
-                    text=True,
-                )
-            if result.returncode == 0:
-                print_success("vercel SDK installed")
-            else:
-                print_warning("Install failed — run manually: pip install 'hermes-agent[vercel]'")
-                if result.stderr:
-                    print_info(f"  Error: {result.stderr.strip().splitlines()[-1]}")
-
-        _prompt_vercel_sandbox_settings(config)
 
     elif selected_backend == "ssh":
         print_success("Terminal backend: SSH")
@@ -1635,8 +1494,6 @@ def setup_terminal_backend(config: dict):
     save_env_value("TERMINAL_ENV", selected_backend)
     if selected_backend == "modal":
         save_env_value("TERMINAL_MODAL_MODE", config["terminal"].get("modal_mode", "auto"))
-    if selected_backend == "vercel_sandbox":
-        save_env_value("TERMINAL_VERCEL_RUNTIME", config["terminal"].get("vercel_runtime", "node24"))
     save_config(config)
     print()
     print_success(f"Terminal backend set to: {selected_backend}")
@@ -1650,11 +1507,7 @@ def setup_terminal_backend(config: dict):
 def _apply_default_agent_settings(config: dict):
     """Apply recommended defaults for all agent settings without prompting."""
     config.setdefault("agent", {})["max_turns"] = 90
-    # config.yaml is the authoritative source for max_turns; the gateway
-    # bridges it into HERMES_MAX_ITERATIONS at startup. We no longer write
-    # to .env to avoid the dual-source inconsistency that caused the
-    # 60-vs-500 bug (stale .env entry silently shadowing config.yaml).
-    remove_env_value("HERMES_MAX_ITERATIONS")
+    save_env_value("HERMES_MAX_ITERATIONS", "90")
 
     config.setdefault("display", {})["tool_progress"] = "all"
 
@@ -1684,10 +1537,9 @@ def setup_agent_settings(config: dict):
     print()
 
     # ── Max Iterations ──
-    # config.yaml is authoritative; read from there. If a legacy .env
-    # entry is still around (from pre-PR#18413 setups), prefer the
-    # config value so we don't surface a stale number to the user.
-    current_max = str(cfg_get(config, "agent", "max_turns", default=90))
+    current_max = get_env_value("HERMES_MAX_ITERATIONS") or str(
+        config.get("agent", {}).get("max_turns", 90)
+    )
     print_info("Maximum tool-calling iterations per conversation.")
     print_info("Higher = more complex tasks, but costs more tokens.")
     print_info(
@@ -1698,13 +1550,9 @@ def setup_agent_settings(config: dict):
     try:
         max_iter = int(max_iter_str)
         if max_iter > 0:
-            # Write to config.yaml (authoritative) only. Also clean up any
-            # stale .env entry from earlier setup runs — the gateway's
-            # bridge in gateway/run.py now unconditionally derives
-            # HERMES_MAX_ITERATIONS from agent.max_turns at startup.
+            save_env_value("HERMES_MAX_ITERATIONS", str(max_iter))
             config.setdefault("agent", {})["max_turns"] = max_iter
             config.pop("max_turns", None)
-            remove_env_value("HERMES_MAX_ITERATIONS")
             print_success(f"Max iterations set to {max_iter}")
     except ValueError:
         print_warning("Invalid number, keeping current value")
@@ -1718,7 +1566,7 @@ def setup_agent_settings(config: dict):
     print_info("  all     — Show every tool call with a short preview")
     print_info("  verbose — Full args, results, and debug logs")
 
-    current_mode = cfg_get(config, "display", "tool_progress", default="all")
+    current_mode = config.get("display", {}).get("tool_progress", "all")
     mode = prompt("Tool progress mode", current_mode)
     if mode.lower() in ("off", "new", "all", "verbose"):
         if "display" not in config:
@@ -1738,7 +1586,7 @@ def setup_agent_settings(config: dict):
 
     config.setdefault("compression", {})["enabled"] = True
 
-    current_threshold = cfg_get(config, "compression", "threshold", default=0.50)
+    current_threshold = config.get("compression", {}).get("threshold", 0.50)
     threshold_str = prompt("Compression threshold (0.5-0.95)", str(current_threshold))
     try:
         threshold = float(threshold_str)
@@ -1999,32 +1847,27 @@ def _setup_slack():
     if existing:
         print_info("Slack: already configured")
         if not prompt_yes_no("Reconfigure Slack?", False):
-            # Even without reconfiguring, offer to refresh the manifest so
-            # new commands (e.g. /btw, /stop, ...) get registered in Slack.
-            if prompt_yes_no(
-                "Regenerate the Slack app manifest with the latest command "
-                "list? (recommended after `hermes update`)",
-                True,
-            ):
-                _write_slack_manifest_and_instruct()
             return
 
     print_info("Steps to create a Slack app:")
-    print_info("   1. Go to https://api.slack.com/apps → Create New App")
-    print_info("      Pick 'From an app manifest' — we'll generate one for you below.")
+    print_info("   1. Go to https://api.slack.com/apps → Create New App (from scratch)")
     print_info("   2. Enable Socket Mode: Settings → Socket Mode → Enable")
     print_info("      • Create an App-Level Token with 'connections:write' scope")
-    print_info("   3. Install to Workspace: Settings → Install App")
-    print_info("   4. After installing, invite the bot to channels: /invite @YourBot")
+    print_info("   3. Add Bot Token Scopes: Features → OAuth & Permissions")
+    print_info("      Required scopes: chat:write, app_mentions:read,")
+    print_info("      channels:history, channels:read, im:history,")
+    print_info("      im:read, im:write, users:read, files:read, files:write")
+    print_info("      Optional for private channels: groups:history")
+    print_info("   4. Subscribe to Events: Features → Event Subscriptions → Enable")
+    print_info("      Required events: message.im, message.channels, app_mention")
+    print_info("      Optional for private channels: message.groups")
+    print_warning("   ⚠ Without message.channels the bot will ONLY work in DMs,")
+    print_warning("     not public channels.")
+    print_info("   5. Install to Workspace: Settings → Install App")
+    print_info("   6. Reinstall the app after any scope or event changes")
+    print_info("   7. After installing, invite the bot to channels: /invite @YourBot")
     print()
     print_info("   Full guide: https://hermes-agent.nousresearch.com/docs/user-guide/messaging/slack/")
-    print()
-
-    # Generate and write manifest up-front so the user can paste it into
-    # the "Create from manifest" flow instead of clicking through scopes /
-    # events / slash commands one at a time.
-    _write_slack_manifest_and_instruct()
-
     print()
     bot_token = prompt("Slack Bot Token (xoxb-...)", password=True)
     if not bot_token:
@@ -2048,49 +1891,6 @@ def _setup_slack():
     else:
         print_warning("⚠️  No Slack allowlist set - unpaired users will be denied by default.")
         print_info("   Set SLACK_ALLOW_ALL_USERS=true or GATEWAY_ALLOW_ALL_USERS=true only if you intentionally want open workspace access.")
-
-
-def _write_slack_manifest_and_instruct():
-    """Generate the Slack manifest, write it under HERMES_HOME, and print
-    paste-into-Slack instructions.
-
-    Exposed as its own helper so both the initial setup flow and the
-    "reconfigure? → no" branch can refresh the manifest without the user
-    re-entering tokens. Failures are non-fatal — if the manifest write
-    fails for any reason, we print a warning and skip rather than abort
-    the whole Slack setup.
-    """
-    try:
-        from hermes_cli.slack_cli import _build_full_manifest
-        from hermes_constants import get_hermes_home
-
-        manifest = _build_full_manifest(
-            bot_name="Hermes",
-            bot_description="Your Hermes agent on Slack",
-        )
-        target = Path(get_hermes_home()) / "slack-manifest.json"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        import json as _json
-        target.write_text(
-            _json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        print_success(f"Slack app manifest written to: {target}")
-        print_info(
-            "   Paste it into https://api.slack.com/apps → your app → Features "
-            "→ App Manifest → Edit, then Save.  Slack will prompt to "
-            "reinstall if scopes or slash commands changed."
-        )
-        print_info(
-            "   Re-run `hermes slack manifest --write` anytime to refresh after "
-            "Hermes adds new commands."
-        )
-    except Exception as exc:  # pragma: no cover - best-effort UX helper
-        print_warning(f"Couldn't write Slack manifest: {exc}")
-        print_info(
-            "   You can generate it manually later with: "
-            "hermes slack manifest --write"
-        )
 
 
 def _setup_matrix():
@@ -2220,7 +2020,74 @@ def _setup_mattermost():
     home_channel = prompt("Home channel ID (leave empty to set later with /set-home)")
     if home_channel:
         save_env_value("MATTERMOST_HOME_CHANNEL", home_channel)
-    print_info("   Open config in your editor:  hermes config edit")
+
+
+def _setup_whatsapp():
+    """Configure WhatsApp bridge."""
+    print_header("WhatsApp")
+    existing = get_env_value("WHATSAPP_ENABLED")
+    if existing:
+        print_info("WhatsApp: already enabled")
+        return
+
+    print_info("WhatsApp connects via a built-in bridge (Baileys).")
+    print_info("Requires Node.js. Run 'hermes whatsapp' for guided setup.")
+    print()
+    if prompt_yes_no("Enable WhatsApp now?", True):
+        save_env_value("WHATSAPP_ENABLED", "true")
+        print_success("WhatsApp enabled")
+        print_info("Run 'hermes whatsapp' to choose your mode (separate bot number")
+        print_info("or personal self-chat) and pair via QR code.")
+
+
+def _setup_weixin():
+    """Configure Weixin (personal WeChat) via iLink Bot API QR login."""
+    from hermes_cli.gateway import _setup_weixin as _gateway_setup_weixin
+    _gateway_setup_weixin()
+
+
+def _setup_signal():
+    """Configure Signal via gateway setup."""
+    from hermes_cli.gateway import _setup_signal as _gateway_setup_signal
+    _gateway_setup_signal()
+
+
+def _setup_email():
+    """Configure Email via gateway setup."""
+    from hermes_cli.gateway import _setup_email as _gateway_setup_email
+    _gateway_setup_email()
+
+
+def _setup_sms():
+    """Configure SMS (Twilio) via gateway setup."""
+    from hermes_cli.gateway import _setup_sms as _gateway_setup_sms
+    _gateway_setup_sms()
+
+
+def _setup_dingtalk():
+    """Configure DingTalk via gateway setup."""
+    from hermes_cli.gateway import _setup_dingtalk as _gateway_setup_dingtalk
+    _gateway_setup_dingtalk()
+
+
+def _setup_feishu():
+    """Configure Feishu / Lark via gateway setup."""
+    from hermes_cli.gateway import _setup_feishu as _gateway_setup_feishu
+    _gateway_setup_feishu()
+
+
+def _setup_wecom():
+    """Configure WeCom (Enterprise WeChat) via gateway setup."""
+    from hermes_cli.gateway import _setup_wecom as _gateway_setup_wecom
+    _gateway_setup_wecom()
+
+
+def _setup_wecom_callback():
+    """Configure WeCom Callback (self-built app) via gateway setup."""
+    from hermes_cli.gateway import _setup_wecom_callback as _gw_setup
+    _gw_setup()
+
+
 
 
 def _setup_bluebubbles():
@@ -2338,27 +2205,188 @@ def _setup_webhooks():
     print_info("   https://hermes-agent.nousresearch.com/docs/user-guide/messaging/webhooks/#configuring-routes")
     print()
     print_info("   Open config in your editor:  hermes config edit")
-    print_info("   Open config in your editor:  hermes config edit")
+
+
+def _setup_teams_meeting_pipeline():
+    """Configure Microsoft Teams meeting pipeline credentials and defaults."""
+    print_header("Microsoft Teams Meeting Pipeline")
+
+    graph_configured = bool(
+        get_env_value("MSGRAPH_TENANT_ID")
+        or get_env_value("MSGRAPH_CLIENT_ID")
+        or get_env_value("MSGRAPH_CLIENT_SECRET")
+    )
+    webhook_enabled = bool(get_env_value("MSGRAPH_WEBHOOK_ENABLED"))
+    teams_delivery = bool(
+        get_env_value("TEAMS_INCOMING_WEBHOOK_URL")
+        or (get_env_value("TEAMS_GRAPH_ACCESS_TOKEN") and get_env_value("TEAMS_TEAM_ID"))
+    )
+
+    if graph_configured or webhook_enabled or teams_delivery:
+        print_info("Teams meeting pipeline: partially configured")
+        if not prompt_yes_no("Reconfigure Teams meeting pipeline?", False):
+            return
+
+    print_info("Use this when you want Hermes to process completed Microsoft Teams meetings:")
+    print_info("  Teams end → Graph notification → transcript/recording fetch → summary → Notion/Linear/Teams")
+    print()
+    print_warning("This setup configures Microsoft Graph credentials and delivery defaults.")
+    print_warning("You still need to create the Azure app registration and Graph subscription.")
+    print_info("Docs will be available under user-guide/messaging/teams-meetings.md.")
+    print()
+
+    print_info("Step 1: Microsoft Graph app-only credentials")
+    print_info("Required Azure app permissions typically include OnlineMeetings.Read.All,")
+    print_info("CallRecords.Read.All, and the transcript/recording scopes your tenant uses.")
+    tenant_id = prompt("Azure tenant ID", get_env_value("MSGRAPH_TENANT_ID") or "")
+    if tenant_id:
+        save_env_value("MSGRAPH_TENANT_ID", tenant_id)
+    client_id = prompt("Azure client ID", get_env_value("MSGRAPH_CLIENT_ID") or "")
+    if client_id:
+        save_env_value("MSGRAPH_CLIENT_ID", client_id)
+    client_secret = prompt(
+        "Azure client secret",
+        password=True,
+    )
+    if client_secret:
+        save_env_value("MSGRAPH_CLIENT_SECRET", client_secret)
+    if tenant_id or client_id or client_secret:
+        print_success("Microsoft Graph credentials saved")
+
+    print()
+    print_info("Step 2: Graph webhook listener")
+    if prompt_yes_no(
+        "Enable the dedicated Microsoft Graph webhook listener?",
+        webhook_enabled or True,
+    ):
+        save_env_value("MSGRAPH_WEBHOOK_ENABLED", "true")
+        webhook_port = prompt(
+            "Webhook port",
+            get_env_value("MSGRAPH_WEBHOOK_PORT") or "8646",
+        )
+        if webhook_port:
+            save_env_value("MSGRAPH_WEBHOOK_PORT", webhook_port)
+        client_state = prompt(
+            "Webhook clientState secret",
+            get_env_value("MSGRAPH_WEBHOOK_CLIENT_STATE") or "",
+        )
+        if client_state:
+            save_env_value("MSGRAPH_WEBHOOK_CLIENT_STATE", client_state)
+        print_success("Microsoft Graph webhook listener configured")
+
+    print()
+    print_info("Step 3: Teams summary delivery")
+    delivery_choice = prompt_choice(
+        "Select Teams delivery mode",
+        [
+            "Incoming webhook (recommended)",
+            "Graph channel posting with delegated bearer token",
+            "Skip Teams delivery for now",
+        ],
+        default=0 if get_env_value("TEAMS_INCOMING_WEBHOOK_URL") else 2,
+    )
+    if delivery_choice == 0:
+        save_env_value("TEAMS_ENABLED", "true")
+        save_env_value("TEAMS_DELIVERY_MODE", "incoming_webhook")
+        webhook_url = prompt(
+            "Teams incoming webhook URL",
+            get_env_value("TEAMS_INCOMING_WEBHOOK_URL") or "",
+        )
+        if webhook_url:
+            save_env_value("TEAMS_INCOMING_WEBHOOK_URL", webhook_url)
+        channel_id = prompt(
+            "Default Teams channel ID (optional but recommended)",
+            get_env_value("TEAMS_CHANNEL_ID") or get_env_value("TEAMS_HOME_CHANNEL") or "",
+        )
+        if channel_id:
+            save_env_value("TEAMS_CHANNEL_ID", channel_id)
+            save_env_value("TEAMS_HOME_CHANNEL", channel_id)
+        print_success("Teams incoming-webhook delivery configured")
+    elif delivery_choice == 1:
+        save_env_value("TEAMS_ENABLED", "true")
+        save_env_value("TEAMS_DELIVERY_MODE", "graph")
+        graph_token = prompt(
+            "Delegated Graph bearer token for channel posting",
+            password=True,
+        )
+        if graph_token:
+            save_env_value("TEAMS_GRAPH_ACCESS_TOKEN", graph_token)
+        team_id = prompt("Teams team ID", get_env_value("TEAMS_TEAM_ID") or "")
+        if team_id:
+            save_env_value("TEAMS_TEAM_ID", team_id)
+        channel_id = prompt(
+            "Teams channel ID",
+            get_env_value("TEAMS_CHANNEL_ID") or get_env_value("TEAMS_HOME_CHANNEL") or "",
+        )
+        if channel_id:
+            save_env_value("TEAMS_CHANNEL_ID", channel_id)
+            save_env_value("TEAMS_HOME_CHANNEL", channel_id)
+        print_success("Teams Graph delivery configured")
+
+    print()
+    print_info("Step 4: Optional sink credentials")
+    if prompt_yes_no("Store a Notion API key now?", bool(get_env_value("NOTION_API_KEY"))):
+        notion_api_key = prompt("Notion API key", password=True)
+        if notion_api_key:
+            save_env_value("NOTION_API_KEY", notion_api_key)
+            print_success("Notion API key saved")
+    if prompt_yes_no("Store a Linear API key now?", bool(get_env_value("LINEAR_API_KEY"))):
+        linear_api_key = prompt("Linear API key", password=True)
+        if linear_api_key:
+            save_env_value("LINEAR_API_KEY", linear_api_key)
+            print_success("Linear API key saved")
+
+    print()
+    print_info("Next steps:")
+    print_info("  1. Start or restart the gateway: hermes gateway")
+    print_info("  2. Create the Graph subscription with 'hermes teams-pipeline subscribe ...'")
+    print_info("  3. Validate local config and sync subscriptions: hermes teams-pipeline validate")
+    print_info("  4. Renew or inspect expiring subscriptions: hermes teams-pipeline maintain-subscriptions --dry-run")
+    print_info("  5. Review sample config/env in the Teams meeting pipeline docs")
+    print_info("  6. Dry-run artifact fetch with the Teams pipeline operator tools")
+
+
+# Platform registry for the gateway checklist
+_GATEWAY_PLATFORMS = [
+    ("Telegram", "TELEGRAM_BOT_TOKEN", _setup_telegram),
+    ("Discord", "DISCORD_BOT_TOKEN", _setup_discord),
+    ("Slack", "SLACK_BOT_TOKEN", _setup_slack),
+    ("Signal", "SIGNAL_HTTP_URL", _setup_signal),
+    ("Email", "EMAIL_ADDRESS", _setup_email),
+    ("SMS (Twilio)", "TWILIO_ACCOUNT_SID", _setup_sms),
+    ("Matrix", "MATRIX_ACCESS_TOKEN", _setup_matrix),
+    ("Mattermost", "MATTERMOST_TOKEN", _setup_mattermost),
+    ("WhatsApp", "WHATSAPP_ENABLED", _setup_whatsapp),
+    ("DingTalk", "DINGTALK_CLIENT_ID", _setup_dingtalk),
+    ("Feishu / Lark", "FEISHU_APP_ID", _setup_feishu),
+    ("WeCom (Enterprise WeChat)", "WECOM_BOT_ID", _setup_wecom),
+    ("WeCom Callback (Self-Built App)", "WECOM_CALLBACK_CORP_ID", _setup_wecom_callback),
+    ("Weixin (WeChat)", "WEIXIN_ACCOUNT_ID", _setup_weixin),
+    ("BlueBubbles (iMessage)", "BLUEBUBBLES_SERVER_URL", _setup_bluebubbles),
+    ("QQ Bot", "QQ_APP_ID", _setup_qqbot),
+    ("Webhooks (GitHub, GitLab, etc.)", "WEBHOOK_ENABLED", _setup_webhooks),
+    ("Microsoft Teams Meeting Pipeline", "MSGRAPH_WEBHOOK_ENABLED", _setup_teams_meeting_pipeline),
+]
 
 
 def setup_gateway(config: dict):
     """Configure messaging platform integrations."""
-    from hermes_cli.gateway import _all_platforms, _platform_status, _configure_platform
-
     print_header("Messaging Platforms")
     print_info("Connect to messaging platforms to chat with Hermes from anywhere.")
     print_info("Toggle with Space, confirm with Enter.")
     print()
 
-    platforms = _all_platforms()
-
-    # Build checklist, pre-selecting already-configured platforms.
+    # Build checklist items, pre-selecting already-configured platforms
     items = []
     pre_selected = []
-    for i, plat in enumerate(platforms):
-        status = _platform_status(plat)
-        items.append(f"{plat['emoji']} {plat['label']}  ({status})")
-        if status == "configured":
+    for i, (name, env_var, _func) in enumerate(_GATEWAY_PLATFORMS):
+        # Matrix has two possible env vars
+        is_configured = bool(get_env_value(env_var))
+        if name == "Matrix" and not is_configured:
+            is_configured = bool(get_env_value("MATRIX_PASSWORD"))
+        label = f"{name}  (configured)" if is_configured else name
+        items.append(label)
+        if is_configured:
             pre_selected.append(i)
 
     selected = prompt_checklist("Select platforms to configure:", items, pre_selected)
@@ -2368,22 +2396,30 @@ def setup_gateway(config: dict):
         return
 
     for idx in selected:
-        _configure_platform(platforms[idx])
+        name, _env_var, setup_func = _GATEWAY_PLATFORMS[idx]
+        setup_func()
 
     # ── Gateway Service Setup ──
-    # Count any platform (built-in or plugin) the user configured during this
-    # setup pass — reuses ``_platform_status`` so plugin platforms like IRC
-    # are picked up without another hard-coded env-var list.
-    def _is_progress(status: str) -> bool:
-        s = status.lower()
-        return not (
-            s == "not configured"
-            or s.startswith("partially")
-            or s.startswith("plugin disabled")
-        )
-
-    any_messaging = any(
-        _is_progress(_platform_status(p)) for p in _all_platforms()
+    any_messaging = (
+        get_env_value("TELEGRAM_BOT_TOKEN")
+        or get_env_value("DISCORD_BOT_TOKEN")
+        or get_env_value("SLACK_BOT_TOKEN")
+        or get_env_value("SIGNAL_HTTP_URL")
+        or get_env_value("EMAIL_ADDRESS")
+        or get_env_value("TWILIO_ACCOUNT_SID")
+        or get_env_value("MATTERMOST_TOKEN")
+        or get_env_value("MATRIX_ACCESS_TOKEN")
+        or get_env_value("MATRIX_PASSWORD")
+        or get_env_value("WHATSAPP_ENABLED")
+        or get_env_value("DINGTALK_CLIENT_ID")
+        or get_env_value("FEISHU_APP_ID")
+        or get_env_value("WECOM_BOT_ID")
+        or get_env_value("WEIXIN_ACCOUNT_ID")
+        or get_env_value("BLUEBUBBLES_SERVER_URL")
+        or get_env_value("QQ_APP_ID")
+        or get_env_value("WEBHOOK_ENABLED")
+        or get_env_value("MSGRAPH_WEBHOOK_ENABLED")
+        or get_env_value("TEAMS_ENABLED")
     )
     if any_messaging:
         print()
@@ -2408,6 +2444,10 @@ def setup_gateway(config: dict):
             get_env_value("QQBOT_HOME_CHANNEL") or get_env_value("QQ_HOME_CHANNEL")
         ):
             missing_home.append("QQBot")
+        if get_env_value("TEAMS_ENABLED") and not (
+            get_env_value("TEAMS_HOME_CHANNEL") or get_env_value("TEAMS_CHANNEL_ID")
+        ):
+            missing_home.append("Teams")
 
         if missing_home:
             print()
@@ -2645,26 +2685,21 @@ def _get_section_config_summary(config: dict, section_key: str) -> Optional[str]
         return "configured"
 
     elif section_key == "terminal":
-        backend = cfg_get(config, "terminal", "backend", default="local")
+        backend = config.get("terminal", {}).get("backend", "local")
         return f"backend: {backend}"
 
     elif section_key == "agent":
-        max_turns = cfg_get(config, "agent", "max_turns", default=90)
+        max_turns = config.get("agent", {}).get("max_turns", 90)
         return f"max turns: {max_turns}"
 
     elif section_key == "gateway":
-        from hermes_cli.gateway import _all_platforms, _platform_status
-        # Count any non-empty status other than the "not configured" sentinel —
-        # platforms like WhatsApp ("enabled, not paired"), Matrix ("configured
-        # + E2EE"), and Signal ("partially configured") all indicate the user
-        # has already started setup and we shouldn't force the section to rerun.
-        configured = [
-            _gateway_platform_short_label(plat["label"])
-            for plat in _all_platforms()
-            if _platform_status(plat) and _platform_status(plat) != "not configured"
+        platforms = [
+            _gateway_platform_short_label(label)
+            for label, env_var, _ in _GATEWAY_PLATFORMS
+            if get_env_value(env_var)
         ]
-        if configured:
-            return ", ".join(configured)
+        if platforms:
+            return ", ".join(platforms)
         return None  # No platforms configured — section must run
 
     elif section_key == "tools":
@@ -2965,6 +3000,17 @@ SETUP_SECTIONS = [
     ("agent", "Agent Settings", setup_agent_settings),
 ]
 
+# The returning-user menu intentionally omits standalone TTS because model setup
+# already includes TTS selection and tools setup covers the rest of the provider
+# configuration. Keep this list in the same order as the visible menu entries.
+RETURNING_USER_MENU_SECTION_KEYS = [
+    "model",
+    "terminal",
+    "gateway",
+    "tools",
+    "agent",
+]
+
 
 def run_setup_wizard(args):
     """Run the interactive setup wizard.
@@ -2988,9 +3034,6 @@ def run_setup_wizard(args):
     if reset_requested:
         save_config(copy.deepcopy(DEFAULT_CONFIG))
         print_success("Configuration reset to defaults.")
-
-    reconfigure_requested = bool(getattr(args, "reconfigure", False))
-    quick_requested = bool(getattr(args, "quick", False))
 
     config = load_config()
     hermes_home = get_hermes_home()
@@ -3083,35 +3126,49 @@ def run_setup_wizard(args):
     migration_ran = False
 
     if is_existing:
-        # Existing install — default is the full-wizard reconfigure flow.
-        # Every prompt shows the current value as its default, so pressing
-        # Enter keeps it.  Opt into `--quick` for the narrow "just fill in
-        # missing items" flow (useful after a partial OpenClaw migration
-        # or when a required API key got cleared).
-        if quick_requested:
+        # ── Returning User Menu ──
+        print()
+        print_header("Welcome Back!")
+        print_success("You already have Hermes configured.")
+        print()
+
+        menu_choices = [
+            "Quick Setup - configure missing items only",
+            "Full Setup - reconfigure everything",
+            "Model & Provider",
+            "Terminal Backend",
+            "Messaging Platforms (Gateway)",
+            "Tools",
+            "Agent Settings",
+            "Exit",
+        ]
+        choice = prompt_choice("What would you like to do?", menu_choices, 0)
+
+        if choice == 0:
+            # Quick setup
             _run_quick_setup(config, hermes_home)
             return
-
-        print()
-        print_header("Reconfigure")
-        print_success("You already have Hermes configured.")
-        print_info("Running the full wizard — each prompt shows your current value.")
-        print_info("Press Enter to keep it, or type a new value to change it.")
-        print_info("")
-        print_info("Tip: jump straight to a section with 'hermes setup model|terminal|")
-        print_info("     gateway|tools|agent', or fill only missing items with --quick.")
-        # Fall through to the "Full Setup — run all sections" block below.
-        # --reconfigure is now the default on existing installs; the flag
-        # is preserved for backwards compatibility but is a no-op here.
+        elif choice == 1:
+            # Full setup — fall through to run all sections
+            pass
+        elif choice == 7:
+            print_info("Exiting. Run 'hermes setup' again when ready.")
+            return
+        elif 2 <= choice <= 6:
+            # Individual section — map by key, not by position.
+            # SETUP_SECTIONS includes TTS but the returning-user menu skips it,
+            # so positional indexing (choice - 2) would dispatch the wrong section.
+            section_key = RETURNING_USER_MENU_SECTION_KEYS[choice - 2]
+            section = next((s for s in SETUP_SECTIONS if s[0] == section_key), None)
+            if section:
+                _, label, func = section
+                func(config)
+                save_config(config)
+                _print_setup_summary(config, hermes_home)
+            return
     else:
         # ── First-Time Setup ──
         print()
-
-        # --reconfigure / --quick on a fresh install are meaningless — fall
-        # through to the normal first-time flow.
-        if reconfigure_requested or quick_requested:
-            print_info("No existing configuration found — running first-time setup.")
-            print()
 
         # Offer OpenClaw migration before configuration begins
         migration_ran = _offer_openclaw_migration(hermes_home)
@@ -3169,14 +3226,33 @@ def run_setup_wizard(args):
     _offer_launch_chat()
 
 
+def _resolve_hermes_chat_argv() -> Optional[list[str]]:
+    """Resolve argv for launching ``hermes chat`` in a fresh process."""
+    hermes_bin = shutil.which("hermes")
+    if hermes_bin:
+        return [hermes_bin, "chat"]
+
+    try:
+        if importlib.util.find_spec("hermes_cli") is not None:
+            return [sys.executable, "-m", "hermes_cli.main", "chat"]
+    except Exception:
+        pass
+
+    return None
+
+
 def _offer_launch_chat():
     """Prompt the user to jump straight into chat after setup."""
     print()
     if not prompt_yes_no("Launch hermes chat now?", True):
         return
 
-    from hermes_cli.relaunch import relaunch
-    relaunch(["chat"])
+    chat_argv = _resolve_hermes_chat_argv()
+    if not chat_argv:
+        print_info("Could not relaunch Hermes automatically. Run 'hermes chat' manually.")
+        return
+
+    os.execvp(chat_argv[0], chat_argv)
 
 
 def _run_first_time_quick_setup(config: dict, hermes_home, is_existing: bool):

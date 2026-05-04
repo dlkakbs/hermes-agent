@@ -1,6 +1,5 @@
 """Tests for setup.py configuration flows."""
 import json
-import os
 import sys
 import types
 
@@ -26,17 +25,6 @@ def _clear_provider_env(monkeypatch):
         "OPENAI_BASE_URL",
         "OPENAI_API_KEY",
         "LLM_MODEL",
-    ):
-        monkeypatch.delenv(key, raising=False)
-
-
-def _clear_vercel_env(monkeypatch):
-    for key in (
-        "TERMINAL_VERCEL_RUNTIME",
-        "VERCEL_OIDC_TOKEN",
-        "VERCEL_TOKEN",
-        "VERCEL_PROJECT_ID",
-        "VERCEL_TEAM_ID",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -174,12 +162,11 @@ def test_setup_gateway_skips_service_install_when_systemctl_missing(monkeypatch,
         "WEBHOOK_ENABLED": "",
     }
 
-    import hermes_cli.gateway as gateway_mod
-
     monkeypatch.setattr(setup_mod, "get_env_value", lambda key: env.get(key, ""))
-    monkeypatch.setattr(gateway_mod, "get_env_value", lambda key: env.get(key, ""))
     monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *args, **kwargs: False)
     monkeypatch.setattr("platform.system", lambda: "Linux")
+
+    import hermes_cli.gateway as gateway_mod
 
     monkeypatch.setattr(gateway_mod, "supports_systemd_services", lambda: False)
     monkeypatch.setattr(gateway_mod, "is_macos", lambda: False)
@@ -213,12 +200,11 @@ def test_setup_gateway_in_container_shows_docker_guidance(monkeypatch, capsys):
         "WEBHOOK_ENABLED": "",
     }
 
-    import hermes_cli.gateway as gateway_mod
-
     monkeypatch.setattr(setup_mod, "get_env_value", lambda key: env.get(key, ""))
-    monkeypatch.setattr(gateway_mod, "get_env_value", lambda key: env.get(key, ""))
     monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *args, **kwargs: False)
     monkeypatch.setattr("platform.system", lambda: "Linux")
+
+    import hermes_cli.gateway as gateway_mod
 
     monkeypatch.setattr(gateway_mod, "supports_systemd_services", lambda: False)
     monkeypatch.setattr(gateway_mod, "is_macos", lambda: False)
@@ -353,41 +339,6 @@ def test_select_provider_and_model_warns_if_named_custom_provider_disappears(
     assert "selected saved custom provider is no longer available" in out
 
 
-def test_select_provider_and_model_accepts_named_provider_from_providers_section(
-    tmp_path, monkeypatch, capsys
-):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    _clear_provider_env(monkeypatch)
-
-    cfg = load_config()
-    cfg["model"] = {
-        "provider": "volcengine-plan",
-        "default": "doubao-seed-2.0-code",
-    }
-    cfg["providers"] = {
-        "volcengine-plan": {
-            "name": "volcengine-plan",
-            "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
-            "default_model": "doubao-seed-2.0-code",
-            "models": {"doubao-seed-2.0-code": {}},
-        }
-    }
-    save_config(cfg)
-
-    monkeypatch.setattr(
-        "hermes_cli.main._prompt_provider_choice",
-        lambda choices, default=0: len(choices) - 1,
-    )
-
-    from hermes_cli.main import select_provider_and_model
-
-    select_provider_and_model()
-
-    out = capsys.readouterr().out
-    assert "Warning: Unknown provider 'volcengine-plan'" not in out
-    assert "Active provider:  volcengine-plan" in out
-
-
 def test_codex_setup_uses_runtime_access_token_for_live_model_list(tmp_path, monkeypatch):
     """Codex model list fetching uses the runtime access token."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -494,91 +445,28 @@ def test_modal_setup_persists_direct_mode_when_user_chooses_their_own_account(tm
     assert config["terminal"]["modal_mode"] == "direct"
 
 
-def test_vercel_setup_configures_access_token_auth(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    _clear_vercel_env(monkeypatch)
-    monkeypatch.setenv("VERCEL_OIDC_TOKEN", "old-oidc")
-    monkeypatch.setitem(sys.modules, "vercel", types.ModuleType("vercel"))
-    config = load_config()
-
-    def fake_prompt_choice(question, choices, default=0):
-        if question == "Select terminal backend:":
-            return 5
-        raise AssertionError(f"Unexpected prompt_choice call: {question}")
-
-    prompt_values = iter(["python3.13", "yes", "2", "4096", "token", "project", "team"])
-
-    monkeypatch.setattr("hermes_cli.setup.prompt_choice", fake_prompt_choice)
-    monkeypatch.setattr("hermes_cli.setup.prompt", lambda *args, **kwargs: next(prompt_values))
-
-    from hermes_cli.setup import setup_terminal_backend
-
-    setup_terminal_backend(config)
-
-    assert config["terminal"]["backend"] == "vercel_sandbox"
-    assert config["terminal"]["vercel_runtime"] == "python3.13"
-    assert config["terminal"]["container_disk"] == 51200
-    assert os.environ["TERMINAL_VERCEL_RUNTIME"] == "python3.13"
-    assert "VERCEL_OIDC_TOKEN" not in os.environ
-    assert os.environ["VERCEL_TOKEN"] == "token"
-    assert os.environ["VERCEL_PROJECT_ID"] == "project"
-    assert os.environ["VERCEL_TEAM_ID"] == "team"
-
-
-def test_vercel_setup_prefills_project_and_team_from_link_file(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    _clear_vercel_env(monkeypatch)
-    project_root = tmp_path / "project"
-    nested = project_root / "app" / "src"
-    nested.mkdir(parents=True)
-    vercel_dir = project_root / ".vercel"
-    vercel_dir.mkdir()
-    (vercel_dir / "project.json").write_text(
-        json.dumps({"projectId": "linked-project", "orgId": "linked-team"}),
-        encoding="utf-8",
-    )
-    monkeypatch.chdir(nested)
-    monkeypatch.setitem(sys.modules, "vercel", types.ModuleType("vercel"))
-    config = load_config()
-    config["terminal"]["container_disk"] = 999
-
-    def fake_prompt_choice(question, choices, default=0):
-        if question == "Select terminal backend:":
-            return 5
-        raise AssertionError(f"Unexpected prompt_choice call: {question}")
-
-    prompt_values = iter(["node24", "no", "1", "5120", "token", "", ""])
-    defaults = {}
-
-    def fake_prompt(message, default="", **kwargs):
-        defaults[message] = default
-        value = next(prompt_values)
-        return value or default
-
-    monkeypatch.setattr("hermes_cli.setup.prompt_choice", fake_prompt_choice)
-    monkeypatch.setattr("hermes_cli.setup.prompt", fake_prompt)
-
-    from hermes_cli.setup import setup_terminal_backend
-
-    setup_terminal_backend(config)
-
-    assert config["terminal"]["backend"] == "vercel_sandbox"
-    assert config["terminal"]["container_persistent"] is False
-    assert config["terminal"]["container_disk"] == 51200
-    assert "VERCEL_OIDC_TOKEN" not in os.environ
-    assert os.environ["VERCEL_TOKEN"] == "token"
-    assert os.environ["VERCEL_PROJECT_ID"] == "linked-project"
-    assert os.environ["VERCEL_TEAM_ID"] == "linked-team"
-    assert defaults["    Vercel project ID"] == "linked-project"
-    assert defaults["    Vercel team ID"] == "linked-team"
-
-
-def test_offer_launch_chat_relaunches_via_bin(monkeypatch):
+def test_resolve_hermes_chat_argv_prefers_which(monkeypatch):
     from hermes_cli import setup as setup_mod
-    from hermes_cli import relaunch as relaunch_mod
+
+    monkeypatch.setattr(setup_mod.shutil, "which", lambda name: "/usr/local/bin/hermes" if name == "hermes" else None)
+
+    assert setup_mod._resolve_hermes_chat_argv() == ["/usr/local/bin/hermes", "chat"]
+
+
+def test_resolve_hermes_chat_argv_falls_back_to_module(monkeypatch):
+    from hermes_cli import setup as setup_mod
+
+    monkeypatch.setattr(setup_mod.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(setup_mod.importlib.util, "find_spec", lambda name: object() if name == "hermes_cli" else None)
+
+    assert setup_mod._resolve_hermes_chat_argv() == [sys.executable, "-m", "hermes_cli.main", "chat"]
+
+
+def test_offer_launch_chat_execs_fresh_process(monkeypatch):
+    from hermes_cli import setup as setup_mod
 
     monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: "/usr/local/bin/hermes")
+    monkeypatch.setattr(setup_mod, "_resolve_hermes_chat_argv", lambda: ["/usr/local/bin/hermes", "chat"])
 
     exec_calls = []
 
@@ -586,7 +474,7 @@ def test_offer_launch_chat_relaunches_via_bin(monkeypatch):
         exec_calls.append((path, argv))
         raise SystemExit(0)
 
-    monkeypatch.setattr(relaunch_mod.os, "execvp", fake_execvp)
+    monkeypatch.setattr(setup_mod.os, "execvp", fake_execvp)
 
     with pytest.raises(SystemExit):
         setup_mod._offer_launch_chat()
@@ -594,22 +482,113 @@ def test_offer_launch_chat_relaunches_via_bin(monkeypatch):
     assert exec_calls == [("/usr/local/bin/hermes", ["/usr/local/bin/hermes", "chat"])]
 
 
-def test_offer_launch_chat_falls_back_to_module(monkeypatch):
+def test_offer_launch_chat_manual_fallback_when_unresolvable(monkeypatch, capsys):
     from hermes_cli import setup as setup_mod
-    from hermes_cli import relaunch as relaunch_mod
 
     monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(relaunch_mod, "resolve_hermes_bin", lambda: None)
+    monkeypatch.setattr(setup_mod, "_resolve_hermes_chat_argv", lambda: None)
 
-    exec_calls = []
+    setup_mod._offer_launch_chat()
 
-    def fake_execvp(path, argv):
-        exec_calls.append((path, argv))
-        raise SystemExit(0)
+    captured = capsys.readouterr()
+    assert "Run 'hermes chat' manually" in captured.out
 
-    monkeypatch.setattr(relaunch_mod.os, "execvp", fake_execvp)
 
-    with pytest.raises(SystemExit):
-        setup_mod._offer_launch_chat()
+def test_setup_teams_meeting_pipeline_can_abort_reconfigure(monkeypatch):
+    env = {
+        "MSGRAPH_TENANT_ID": "tenant-1",
+        "MSGRAPH_CLIENT_ID": "",
+        "MSGRAPH_WEBHOOK_ENABLED": "",
+        "TEAMS_INCOMING_WEBHOOK_URL": "",
+        "TEAMS_GRAPH_ACCESS_TOKEN": "",
+        "TEAMS_TEAM_ID": "",
+    }
+    saved = {}
 
-    assert exec_calls == [(sys.executable, [sys.executable, "-m", "hermes_cli.main", "chat"])]
+    monkeypatch.setattr(setup_mod, "get_env_value", lambda key: env.get(key, ""))
+    monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda question, default=False: False)
+    monkeypatch.setattr(
+        setup_mod,
+        "prompt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("prompt should not be called")),
+    )
+    monkeypatch.setattr(
+        setup_mod,
+        "prompt_choice",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("prompt_choice should not be called")),
+    )
+    monkeypatch.setattr(setup_mod, "save_env_value", lambda key, value: saved.__setitem__(key, value))
+
+    setup_mod._setup_teams_meeting_pipeline()
+    assert saved == {}
+
+
+def test_setup_teams_meeting_pipeline_incoming_webhook_flow(monkeypatch):
+    env = {
+        "MSGRAPH_TENANT_ID": "",
+        "MSGRAPH_CLIENT_ID": "",
+        "MSGRAPH_CLIENT_SECRET": "",
+        "MSGRAPH_WEBHOOK_ENABLED": "",
+        "MSGRAPH_WEBHOOK_PORT": "",
+        "MSGRAPH_WEBHOOK_CLIENT_STATE": "",
+        "TEAMS_INCOMING_WEBHOOK_URL": "",
+        "TEAMS_CHANNEL_ID": "",
+        "TEAMS_HOME_CHANNEL": "",
+        "NOTION_API_KEY": "",
+        "LINEAR_API_KEY": "",
+    }
+    saved = {}
+    prompt_values = iter(
+        [
+            "tenant-1",
+            "client-1",
+            "secret-1",
+            "8646",
+            "client-state-1",
+            "https://example.com/teams-webhook",
+            "19:channel-123",
+            "notion-secret",
+        ]
+    )
+
+    def fake_get_env_value(key):
+        return saved.get(key, env.get(key, ""))
+
+    def fake_prompt(_message, *_args, **_kwargs):
+        return next(prompt_values)
+
+    def fake_prompt_yes_no(question, default=False):
+        if question == "Enable the dedicated Microsoft Graph webhook listener?":
+            return True
+        if question == "Store a Notion API key now?":
+            return True
+        if question == "Store a Linear API key now?":
+            return False
+        raise AssertionError(f"Unexpected prompt_yes_no call: {question}")
+
+    def fake_prompt_choice(question, choices, default=0):
+        assert question == "Select Teams delivery mode"
+        assert choices[0] == "Incoming webhook (recommended)"
+        return 0
+
+    monkeypatch.setattr(setup_mod, "get_env_value", fake_get_env_value)
+    monkeypatch.setattr(setup_mod, "prompt", fake_prompt)
+    monkeypatch.setattr(setup_mod, "prompt_yes_no", fake_prompt_yes_no)
+    monkeypatch.setattr(setup_mod, "prompt_choice", fake_prompt_choice)
+    monkeypatch.setattr(setup_mod, "save_env_value", lambda key, value: saved.__setitem__(key, value))
+
+    setup_mod._setup_teams_meeting_pipeline()
+
+    assert saved["MSGRAPH_TENANT_ID"] == "tenant-1"
+    assert saved["MSGRAPH_CLIENT_ID"] == "client-1"
+    assert saved["MSGRAPH_CLIENT_SECRET"] == "secret-1"
+    assert saved["MSGRAPH_WEBHOOK_ENABLED"] == "true"
+    assert saved["MSGRAPH_WEBHOOK_PORT"] == "8646"
+    assert saved["MSGRAPH_WEBHOOK_CLIENT_STATE"] == "client-state-1"
+    assert saved["TEAMS_ENABLED"] == "true"
+    assert saved["TEAMS_DELIVERY_MODE"] == "incoming_webhook"
+    assert saved["TEAMS_INCOMING_WEBHOOK_URL"] == "https://example.com/teams-webhook"
+    assert saved["TEAMS_CHANNEL_ID"] == "19:channel-123"
+    assert saved["TEAMS_HOME_CHANNEL"] == "19:channel-123"
+    assert saved["NOTION_API_KEY"] == "notion-secret"
+    assert "LINEAR_API_KEY" not in saved
