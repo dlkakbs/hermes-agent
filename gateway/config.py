@@ -71,6 +71,9 @@ class Platform(Enum):
     QQBOT = "qqbot"
 
 
+_BUILTIN_PLATFORM_VALUES = frozenset(platform.value for platform in Platform)
+
+
 @dataclass
 class HomeChannel:
     """
