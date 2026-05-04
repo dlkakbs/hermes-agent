@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from hermes_constants import display_hermes_home
+from gateway.config import Platform, load_gateway_config
 from tools.microsoft_graph_auth import GraphCredentials, MicrosoftGraphConfigError, MicrosoftGraphTokenProvider
 from tools.microsoft_graph_client import MicrosoftGraphClient
 from tools.microsoft_graph_subscription_tools import maintain_graph_subscriptions
@@ -90,25 +91,19 @@ def _validate_configuration_snapshot(store: TeamsPipelineStore) -> dict[str, Any
     env = os.environ
     issues: list[str] = []
     warnings: list[str] = []
+    gateway_config = load_gateway_config()
+    webhook_config = gateway_config.platforms.get(Platform.MSGRAPH_WEBHOOK)
+    teams_config = gateway_config.platforms.get(Platform.TEAMS)
 
     graph = {
         "tenant_id": bool(env.get("MSGRAPH_TENANT_ID")),
         "client_id": bool(env.get("MSGRAPH_CLIENT_ID")),
         "client_secret": bool(env.get("MSGRAPH_CLIENT_SECRET")),
     }
-    webhook_enabled = str(env.get("MSGRAPH_WEBHOOK_ENABLED", "")).strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    teams_enabled = str(env.get("TEAMS_ENABLED", "")).strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    teams_mode = str(env.get("TEAMS_DELIVERY_MODE", "")).strip() or None
+    webhook_enabled = bool(webhook_config and webhook_config.enabled)
+    teams_enabled = bool(teams_config and teams_config.enabled)
+    teams_extra = dict((teams_config.extra or {}) if teams_config else {})
+    teams_mode = str(teams_extra.get("delivery_mode") or "").strip() or None
 
     if not all(graph.values()):
         issues.append("Microsoft Graph app-only credentials are incomplete.")
@@ -117,12 +112,19 @@ def _validate_configuration_snapshot(store: TeamsPipelineStore) -> dict[str, Any
     if not teams_enabled:
         warnings.append("Teams outbound delivery is disabled.")
     elif teams_mode == "incoming_webhook":
-        if not env.get("TEAMS_INCOMING_WEBHOOK_URL"):
+        if not teams_extra.get("incoming_webhook_url"):
             issues.append("TEAMS_INCOMING_WEBHOOK_URL is required for incoming_webhook mode.")
     elif teams_mode == "graph":
-        for key in ("TEAMS_GRAPH_ACCESS_TOKEN", "TEAMS_TEAM_ID", "TEAMS_CHANNEL_ID"):
-            if not env.get(key):
-                issues.append(f"{key} is required for graph delivery mode.")
+        missing: list[str] = []
+        if not (teams_config.token if teams_config else "") and not teams_extra.get("access_token"):
+            missing.append("TEAMS_GRAPH_ACCESS_TOKEN")
+        if not teams_extra.get("team_id"):
+            missing.append("TEAMS_TEAM_ID")
+        channel_id = teams_extra.get("channel_id") or teams_extra.get("chat_id")
+        if not channel_id and not (teams_config and teams_config.home_channel):
+            missing.append("TEAMS_CHANNEL_ID")
+        for key in missing:
+            issues.append(f"{key} is required for graph delivery mode.")
     else:
         warnings.append("TEAMS_DELIVERY_MODE is not set.")
 

@@ -382,6 +382,42 @@ def test_validate_reports_local_config(monkeypatch, capsys, tmp_path):
     assert payload["webhook_enabled"] is True
 
 
+def test_validate_uses_runtime_config_yaml(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("MSGRAPH_TENANT_ID", "tenant-1")
+    monkeypatch.setenv("MSGRAPH_CLIENT_ID", "client-1")
+    monkeypatch.setenv("MSGRAPH_CLIENT_SECRET", "secret-1")
+
+    (tmp_path / "config.yaml").write_text(
+        """
+platforms:
+  msgraph_webhook:
+    enabled: true
+  teams:
+    enabled: true
+    extra:
+      delivery_mode: incoming_webhook
+      incoming_webhook_url: https://example.com/teams-webhook
+      channel_id: channel-1
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    store_path = tmp_path / "teams_pipeline_store.json"
+    teams_pipeline_command(
+        _make_args(
+            teams_pipeline_action="validate",
+            store_path=str(store_path),
+            skip_remote=True,
+        )
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["webhook_enabled"] is True
+    assert payload["teams_enabled"] is True
+    assert payload["teams_delivery_mode"] == "incoming_webhook"
+
+
 def test_validate_syncs_remote_subscriptions(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("MSGRAPH_TENANT_ID", "tenant-1")
     monkeypatch.setenv("MSGRAPH_CLIENT_ID", "client-1")
