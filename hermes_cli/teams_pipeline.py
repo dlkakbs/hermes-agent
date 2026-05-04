@@ -51,6 +51,17 @@ def _iso_utc_timestamp(hours_from_now: int) -> str:
     ).isoformat().replace("+00:00", "Z")
 
 
+def _default_change_type_for_resource(resource: str) -> str:
+    normalized = str(resource or "").strip().lower()
+    if normalized.startswith("communications/onlinemeetings/getalltranscripts"):
+        return "created"
+    if normalized.startswith("communications/onlinemeetings/getallrecordings"):
+        return "created"
+    if normalized.startswith("communications/callrecords"):
+        return "created"
+    return "updated"
+
+
 def _compact_job(job: dict) -> dict:
     payload = dict(job)
     summary = dict(payload.get("summary_payload") or {})
@@ -295,7 +306,10 @@ def _cmd_subscribe(args) -> None:
     store = TeamsPipelineStore(_store_path(getattr(args, "store_path", None)))
     resource = str(getattr(args, "resource", "") or "").strip()
     notification_url = str(getattr(args, "notification_url", "") or "").strip()
-    change_type = str(getattr(args, "change_type", "") or "").strip() or "updated"
+    change_type = (
+        str(getattr(args, "change_type", "") or "").strip()
+        or _default_change_type_for_resource(resource)
+    )
     expiration = str(getattr(args, "expiration", "") or "").strip() or _iso_utc_timestamp(1)
     client_state = str(getattr(args, "client_state", "") or "").strip()
     lifecycle_url = str(getattr(args, "lifecycle_notification_url", "") or "").strip()

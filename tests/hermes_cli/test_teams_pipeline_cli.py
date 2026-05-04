@@ -120,6 +120,36 @@ def test_subscriptions_lists_graph_subscriptions(monkeypatch, capsys):
     assert "getAllTranscripts" in out
 
 
+def test_subscribe_defaults_to_created_for_transcript_resources(monkeypatch, capsys):
+    captured = {}
+
+    class FakeClient:
+        async def post_json(self, path, json_body=None, headers=None):
+            captured["path"] = path
+            captured["json_body"] = json_body
+            return {
+                "id": "sub-transcript",
+                "resource": json_body["resource"],
+                "changeType": json_body["changeType"],
+                "notificationUrl": json_body["notificationUrl"],
+                "expirationDateTime": json_body["expirationDateTime"],
+            }
+
+    monkeypatch.setattr("hermes_cli.teams_pipeline._build_graph_client", lambda: FakeClient())
+    teams_pipeline_command(
+        _make_args(
+            teams_pipeline_action="subscribe",
+            resource="communications/onlineMeetings/getAllTranscripts",
+            notification_url="https://example.com/webhooks/msgraph",
+            change_type="",
+        )
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert captured["path"] == "/subscriptions"
+    assert captured["json_body"]["changeType"] == "created"
+    assert payload["changeType"] == "created"
+
+
 def test_subscriptions_sync_local_store(monkeypatch, capsys, tmp_path):
     class FakeClient:
         async def collect_paginated(self, path):

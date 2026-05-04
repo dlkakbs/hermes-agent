@@ -8860,7 +8860,7 @@ def main():
     )
     teams_pipeline_subscribe.add_argument(
         "--change-type",
-        default="updated",
+        default="",
         help="Microsoft Graph changeType value",
     )
     teams_pipeline_subscribe.add_argument(
