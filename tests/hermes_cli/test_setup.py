@@ -614,7 +614,6 @@ def test_offer_launch_chat_falls_back_to_module(monkeypatch):
 
     assert exec_calls == [(sys.executable, [sys.executable, "-m", "hermes_cli.main", "chat"])]
 
-
 def test_setup_teams_meeting_pipeline_can_abort_reconfigure(monkeypatch):
     from hermes_cli import setup as setup_mod
 
@@ -717,3 +716,35 @@ def test_setup_teams_meeting_pipeline_incoming_webhook_flow(monkeypatch):
     assert saved["TEAMS_HOME_CHANNEL"] == "19:channel-123"
     assert saved["NOTION_API_KEY"] == "notion-secret"
     assert "LINEAR_API_KEY" not in saved
+
+
+def test_setup_slack_saves_home_channel(monkeypatch):
+    """_setup_slack() saves SLACK_HOME_CHANNEL when the user provides one."""
+    saved = {}
+    prompts = iter(["xoxb-test-token", "xapp-test-token", "", "C01ABC2DE3F"])
+
+    monkeypatch.setattr(setup_mod, "get_env_value", lambda key: "")
+    monkeypatch.setattr(setup_mod, "save_env_value", lambda k, v: saved.update({k: v}))
+    monkeypatch.setattr(setup_mod, "prompt", lambda *_a, **_kw: next(prompts))
+    monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *_a, **_kw: False)
+    monkeypatch.setattr(setup_mod, "_write_slack_manifest_and_instruct", lambda: None)
+
+    setup_mod._setup_slack()
+
+    assert saved.get("SLACK_HOME_CHANNEL") == "C01ABC2DE3F"
+
+
+def test_setup_slack_home_channel_empty_not_saved(monkeypatch):
+    """_setup_slack() does not save SLACK_HOME_CHANNEL when left blank."""
+    saved = {}
+    prompts = iter(["xoxb-test-token", "xapp-test-token", "", ""])
+
+    monkeypatch.setattr(setup_mod, "get_env_value", lambda key: "")
+    monkeypatch.setattr(setup_mod, "save_env_value", lambda k, v: saved.update({k: v}))
+    monkeypatch.setattr(setup_mod, "prompt", lambda *_a, **_kw: next(prompts))
+    monkeypatch.setattr(setup_mod, "prompt_yes_no", lambda *_a, **_kw: False)
+    monkeypatch.setattr(setup_mod, "_write_slack_manifest_and_instruct", lambda: None)
+
+    setup_mod._setup_slack()
+
+    assert "SLACK_HOME_CHANNEL" not in saved
