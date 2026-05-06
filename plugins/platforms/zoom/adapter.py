@@ -297,6 +297,16 @@ class ZoomTeamChatAdapter(BasePlatformAdapter):
         actual = signature.split("=", 1)[-1]
         return hmac.compare_digest(expected.encode("utf-8"), actual.encode("utf-8"))
 
+    def _is_self_event(self, normalized: Dict[str, Any]) -> bool:
+        user_id = _coerce_text(normalized.get("user_id"))
+        if user_id and self._bot_jid and user_id == self._bot_jid:
+            return True
+
+        raw = normalized.get("raw") or {}
+        obj = _deep_get(raw, "payload", "object") or raw.get("object") or {}
+        sender_jid = _coerce_text(_find_first(obj, ("sender_jid", "user_jid", "robot_jid", "bot_jid")))
+        return bool(sender_jid and self._bot_jid and sender_jid == self._bot_jid)
+
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         return web.json_response({"ok": True, "platform": "zoom"})
 
@@ -330,6 +340,8 @@ class ZoomTeamChatAdapter(BasePlatformAdapter):
             )
 
         normalized = normalize_zoom_chat_event(payload)
+        if self._is_self_event(normalized):
+            return web.json_response({"ok": True, "ignored": True, "reason": "self_message"})
         if not normalized["text"] or not normalized["chat_id"]:
             return web.json_response(
                 {"ok": True, "ignored": True, "reason": "no text/chat_id"},

@@ -80,6 +80,71 @@ def test_register_adds_zoom_platform_entry():
     assert callable(calls["adapter_factory"])
 
 
+def test_send_uses_client_and_preserves_reply_to(monkeypatch):
+    adapter = ZoomTeamChatAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "account_id": "acct",
+                "client_id": "cid",
+                "client_secret": "sec",
+                "bot_jid": "bot-jid",
+                "webhook_secret": "zoom-secret",
+            },
+        )
+    )
+
+    captured = {}
+
+    class _FakeClient:
+        def send_message(self, *, chat_id: str, content: str, reply_to: str | None = None):
+            captured["chat_id"] = chat_id
+            captured["content"] = content
+            captured["reply_to"] = reply_to
+            return {"message_id": "out-1"}
+
+    monkeypatch.setattr(adapter, "_client", lambda: _FakeClient())
+
+    import asyncio
+
+    result = asyncio.run(adapter.send("chat-1", "hello zoom", reply_to="root-9"))
+    assert result.success is True
+    assert result.message_id == "out-1"
+    assert captured == {
+        "chat_id": "chat-1",
+        "content": "hello zoom",
+        "reply_to": "root-9",
+    }
+
+
+def test_send_returns_retryable_error_on_client_failure(monkeypatch):
+    adapter = ZoomTeamChatAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "account_id": "acct",
+                "client_id": "cid",
+                "client_secret": "sec",
+                "bot_jid": "bot-jid",
+                "webhook_secret": "zoom-secret",
+            },
+        )
+    )
+
+    class _FailingClient:
+        def send_message(self, *, chat_id: str, content: str, reply_to: str | None = None):
+            raise RuntimeError("send failed")
+
+    monkeypatch.setattr(adapter, "_client", lambda: _FailingClient())
+
+    import asyncio
+
+    result = asyncio.run(adapter.send("chat-1", "hello zoom"))
+    assert result.success is False
+    assert result.retryable is True
+    assert "send failed" in result.error
+
+
 def test_webhook_handler_validates_and_dispatches(monkeypatch):
     adapter = ZoomTeamChatAdapter(
         PlatformConfig(
@@ -161,3 +226,63 @@ def test_webhook_handler_validates_and_dispatches(monkeypatch):
     asyncio.run(_run())
     assert captured["event"].text == "zoom adapter smoke"
     assert captured["event"].source.chat_id == "chat-123"
+
+
+def test_webhook_handler_ignores_self_messages(monkeypatch):
+    adapter = ZoomTeamChatAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "account_id": "acct",
+                "client_id": "cid",
+                "client_secret": "sec",
+                "bot_jid": "bot-jid",
+                "webhook_secret": "zoom-secret",
+            },
+        )
+    )
+
+    called = {"count": 0}
+
+    async def _fake_handle_message(event):
+        called["count"] += 1
+
+    monkeypatch.setattr(adapter, "handle_message", _fake_handle_message)
+
+    class _Request:
+        def __init__(self, payload: dict, headers: dict[str, str]):
+            self._body = json.dumps(payload).encode("utf-8")
+            self.headers = headers
+
+        async def read(self) -> bytes:
+            return self._body
+
+    async def _run():
+        payload = {
+            "event": "chat.message.sent",
+            "payload": {
+                "object": {
+                    "to_jid": "chat-123",
+                    "message_id": "m-self",
+                    "sender_jid": "bot-jid",
+                    "sender_name": "Hermes",
+                    "message": {"text": "ignore me"},
+                }
+            },
+        }
+        timestamp = "1700000000"
+        sig = compute_zoom_request_signature(
+            "zoom-secret",
+            timestamp,
+            json.dumps(payload).encode("utf-8"),
+        )
+        req = _Request(payload, {"x-zm-request-timestamp": timestamp, "x-zm-signature": f"v0={sig}"})
+        response = await adapter._handle_webhook(req)
+        body = json.loads(response.text)
+        assert body["ignored"] is True
+        assert body["reason"] == "self_message"
+
+    import asyncio
+
+    asyncio.run(_run())
+    assert called["count"] == 0
