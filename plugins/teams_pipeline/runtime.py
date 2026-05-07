@@ -51,10 +51,18 @@ def build_pipeline_runtime_config(gateway_config: Any) -> dict[str, Any]:
 
 
 def build_pipeline_runtime(gateway: Any) -> TeamsMeetingPipeline:
+    teams_sender = None
+    teams_config = gateway.config.platforms.get(Platform("teams"))
+    if teams_config and teams_config.enabled:
+        from plugins.platforms.teams.adapter import TeamsSummaryWriter
+
+        teams_sender = TeamsSummaryWriter(platform_config=teams_config)
+
     return TeamsMeetingPipeline(
         graph_client=build_graph_client(),
         store=TeamsPipelineStore(resolve_teams_pipeline_store_path()),
         config=build_pipeline_runtime_config(gateway.config),
+        teams_sender=teams_sender,
     )
 
 
