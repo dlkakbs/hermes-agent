@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import sys
+from types import ModuleType
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from gateway.config import Platform, PlatformConfig
 from gateway.run import GatewayRunner
-from plugins.teams_pipeline.runtime import build_pipeline_runtime, build_pipeline_runtime_config
+from plugins.teams_pipeline.runtime import (
+    bind_gateway_runtime,
+    build_pipeline_runtime,
+    build_pipeline_runtime_config,
+)
 
 
 def test_gateway_runner_wires_teams_pipeline_runtime(monkeypatch):
@@ -41,6 +47,29 @@ def test_gateway_runner_skips_wiring_without_msgraph_adapter(monkeypatch):
         return True
 
     monkeypatch.setattr("plugins.teams_pipeline.runtime.bind_gateway_runtime", _bind)
+
+    GatewayRunner._wire_teams_pipeline_runtime(runner)
+
+    assert called is False
+
+
+def test_gateway_runner_skips_wiring_when_teams_pipeline_plugin_disabled(monkeypatch):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.adapters = {Platform.MSGRAPH_WEBHOOK: object()}
+    runner._teams_pipeline_runtime_error = None
+
+    called = False
+
+    def _bind(_gateway_runner):
+        nonlocal called
+        called = True
+        return True
+
+    monkeypatch.setattr("plugins.teams_pipeline.runtime.bind_gateway_runtime", _bind)
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"plugins": {"enabled": []}},
+    )
 
     GatewayRunner._wire_teams_pipeline_runtime(runner)
 
@@ -114,7 +143,43 @@ def test_build_pipeline_runtime_skips_sender_when_adapter_layer_is_unavailable(m
         "plugins.teams_pipeline.runtime.TeamsPipelineStore",
         lambda path: {"path": path},
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "plugins.platforms.teams.adapter",
+        ModuleType("plugins.platforms.teams.adapter"),
+    )
 
     runtime = build_pipeline_runtime(gateway)
 
     assert runtime.teams_sender is None
+
+
+def test_bind_gateway_runtime_leaves_scheduler_unchanged_on_failure(monkeypatch):
+    class FakeAdapter:
+        def __init__(self):
+            self.scheduler = None
+
+        def set_notification_scheduler(self, scheduler):
+            self.scheduler = scheduler
+
+    gateway = SimpleNamespace(
+        adapters={Platform.MSGRAPH_WEBHOOK: FakeAdapter()},
+        config=SimpleNamespace(
+            platforms={
+                Platform("teams"): PlatformConfig(enabled=True, extra={}),
+            }
+        ),
+        _teams_pipeline_runtime=None,
+        _teams_pipeline_runtime_error=None,
+    )
+
+    monkeypatch.setattr(
+        "plugins.teams_pipeline.runtime.build_pipeline_runtime",
+        lambda _gateway: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    bound = bind_gateway_runtime(gateway)
+
+    assert bound is False
+    assert gateway.adapters[Platform.MSGRAPH_WEBHOOK].scheduler is None
+    assert gateway._teams_pipeline_runtime_error == "boom"

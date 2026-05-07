@@ -109,20 +109,11 @@ def bind_gateway_runtime(gateway: Any) -> bool:
         runtime = build_pipeline_runtime(gateway)
     except Exception as exc:
         error_message = str(exc)
-
-        async def _drop_notification(
-            notification: dict[str, Any],
-            event: Any,
-            *,
-            _error_message: str = error_message,
-        ) -> None:
-            logger.warning(
-                "Dropping Microsoft Graph notification because Teams pipeline runtime is unavailable: %s",
-                _error_message,
-            )
-
-        adapter.set_notification_scheduler(_drop_notification)
         gateway._teams_pipeline_runtime_error = error_message
+        logger.warning(
+            "Teams pipeline runtime unavailable; leaving webhook scheduler unchanged: %s",
+            error_message,
+        )
         return False
 
     async def _schedule(notification: dict[str, Any], event: Any) -> None:
