@@ -9765,9 +9765,10 @@ Examples:
     # own argparse tree.  No hardcoded plugin commands in main.py.
     # =========================================================================
     try:
-        from plugins.memory import discover_plugin_cli_commands
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
 
-        for cmd_info in discover_plugin_cli_commands():
+        discover_plugins()
+        for cmd_info in get_plugin_manager()._cli_commands.values():
             plugin_parser = subparsers.add_parser(
                 cmd_info["name"],
                 help=cmd_info["help"],
@@ -9775,6 +9776,8 @@ Examples:
                 formatter_class=__import__("argparse").RawDescriptionHelpFormatter,
             )
             cmd_info["setup_fn"](plugin_parser)
+            if cmd_info.get("handler_fn") is not None:
+                plugin_parser.set_defaults(func=cmd_info["handler_fn"])
     except Exception as _exc:
         logging.getLogger(__name__).debug("Plugin CLI discovery failed: %s", _exc)
 

@@ -294,6 +294,7 @@ class TeamsMeetingPipeline:
 
     def create_job_from_notification(self, notification: dict[str, Any]) -> TeamsMeetingPipelineJob:
         event_id = TeamsPipelineStore.build_notification_receipt_key(notification)
+        self.store.record_notification_receipt(event_id, notification)
         existing_job = self._find_job_by_dedupe_key(event_id)
         if existing_job is not None:
             return existing_job
