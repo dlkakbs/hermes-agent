@@ -422,5 +422,6 @@ Each platform has its own toolset:
 - [QQBot Setup](qqbot.md)
 - [Yuanbao Setup](yuanbao.md)
 - [Microsoft Teams Setup](teams.md)
+- [Teams Meetings Pipeline](teams-meetings.md)
 - [Open WebUI + API Server](open-webui.md)
 - [Webhooks](webhooks.md)
