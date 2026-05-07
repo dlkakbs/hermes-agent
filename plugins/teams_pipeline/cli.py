@@ -220,8 +220,14 @@ def _validate_configuration_snapshot(store: TeamsPipelineStore) -> dict[str, Any
             issues.append("TEAMS_INCOMING_WEBHOOK_URL is required for incoming_webhook mode.")
     elif teams_mode == "graph":
         missing: list[str] = []
-        if not (teams_config.token if teams_config else "") and not teams_extra.get("access_token"):
-            missing.append("TEAMS_GRAPH_ACCESS_TOKEN")
+        has_graph_delivery_token = bool(
+            (teams_config.token if teams_config else "") or teams_extra.get("access_token")
+        )
+        has_graph_app_credentials = all(graph.values())
+        if not has_graph_delivery_token and not has_graph_app_credentials:
+            missing.append(
+                "TEAMS_GRAPH_ACCESS_TOKEN or complete MSGRAPH_* app credentials"
+            )
         if not teams_extra.get("team_id"):
             missing.append("TEAMS_TEAM_ID")
         channel_id = teams_extra.get("channel_id") or teams_extra.get("chat_id")

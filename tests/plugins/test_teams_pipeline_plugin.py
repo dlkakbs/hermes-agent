@@ -433,3 +433,5 @@ class TestTeamsMeetingPipeline:
         assert second_job.job_id == first_job.job_id
         assert summarize_calls == 1
         assert len(store.list_jobs()) == 1
+        receipt_key = TeamsPipelineStore.build_notification_receipt_key(notification)
+        assert store.has_notification_receipt(receipt_key) is True
